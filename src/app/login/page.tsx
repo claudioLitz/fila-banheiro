@@ -1,33 +1,52 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { supabase } from "@/lib/supabase";
-import { useRouter } from "next/navigation";
 
 export default function Login() {
+
   const [email, setEmail] = useState("");
   const [senha, setSenha] = useState("");
-  const router = useRouter();
+  const [erro, setErro] = useState("");
+  const [carregando, setCarregando] = useState(false);
+
+  // Verifica se já existe sessão ativa
+  useEffect(() => {
+    const verificarSessao = async () => {
+      const { data } = await supabase.auth.getSession();
+
+      if (data.session) {
+        window.location.href = "/";
+      }
+    };
+
+    verificarSessao();
+  }, []);
 
   const fazerLogin = async (e: React.FormEvent) => {
     e.preventDefault();
 
+    setErro("");
+    setCarregando(true);
+
     const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password: senha,
+      email: email,
+      password: senha
     });
 
-    if (!error) {
-      router.push("/");
-    } else {
-      alert("Credenciais inválidas");
+    if (error) {
+      setErro("Email ou senha inválidos");
+      setCarregando(false);
+      return;
     }
+
+    window.location.href = "/";
   };
 
   return (
     <main className="min-h-screen flex flex-col">
 
-      {/* Barra superior estilo institucional */}
+      {/* Barra superior institucional */}
       <header
         className="text-white px-8 py-4 shadow"
         style={{ background: "var(--weg-blue)" }}
@@ -38,7 +57,8 @@ export default function Login() {
       </header>
 
       {/* Área central */}
-      <div className="flex flex-1 items-center justify-center px-6"
+      <div
+        className="flex flex-1 items-center justify-center px-6"
         style={{ background: "var(--weg-gray)" }}
       >
         <div
@@ -47,7 +67,8 @@ export default function Login() {
         >
 
           <div className="text-center mb-6">
-            <h2 className="text-2xl font-bold"
+            <h2
+              className="text-2xl font-bold"
               style={{ color: "var(--weg-blue)" }}
             >
               Acesso ao Sistema
@@ -65,6 +86,7 @@ export default function Login() {
               placeholder="Email institucional"
               className="w-full px-4 py-2 rounded-lg border focus:outline-none"
               style={{ border: "1px solid var(--weg-border)" }}
+              value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
             />
@@ -74,16 +96,25 @@ export default function Login() {
               placeholder="Senha"
               className="w-full px-4 py-2 rounded-lg border focus:outline-none"
               style={{ border: "1px solid var(--weg-border)" }}
+              value={senha}
               onChange={(e) => setSenha(e.target.value)}
               required
             />
 
             <button
+              type="submit"
+              disabled={carregando}
               className="w-full py-2 rounded-lg text-white font-medium transition-colors"
               style={{ background: "var(--weg-blue)" }}
             >
-              Entrar
+              {carregando ? "Entrando..." : "Entrar"}
             </button>
+
+            {erro && (
+              <p className="text-red-500 text-sm text-center">
+                {erro}
+              </p>
+            )}
           </form>
         </div>
       </div>
