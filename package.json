@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "opennextjs-cloudflare build",
+    "build": "next build",
     "dev": "next dev",
     "start": "next start",
     "lint": "eslint",
@@ -37,5 +37,4 @@
     "typescript": "^5",
     "wrangler": "^4.74.0"
   }
-  
 }
