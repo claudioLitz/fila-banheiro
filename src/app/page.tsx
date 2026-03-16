@@ -28,6 +28,7 @@ type UserDB = {
   name: string;
   acess_level: string;
   email?: string;
+  fives_count?: number; 
 };
 
 type Classroom = {
@@ -35,6 +36,7 @@ type Classroom = {
   name: string;
   time_limit_minutes: number;
   student_count?: number;
+  qtd_5s?: number;
 };
 
 type ClassroomTeacherDB = {
@@ -86,6 +88,106 @@ export default function Home() {
   const [novoUserCargo, setNovoUserCargo] = useState("aluno");
 
   const [isStatsExpanded, setIsStatsExpanded] = useState(false);
+  // ================= LÓGICA DO 5S =================
+
+  const alterarQtd5S = async (novaQtd: number) => {
+    if (!turmaAtiva) return;
+    setTurmaAtiva({ ...turmaAtiva, qtd_5s: novaQtd });
+    await supabase.from("classrooms").update({ qtd_5s: novaQtd }).eq("id", turmaAtiva.id);
+    registrarAuditoria(`Alterou a quantidade do 5S para ${novaQtd} [TURMA:${turmaAtiva.name}]`);
+  };
+
+  const alunosPara5S = () => {
+    if (!alunosNaTurmaAtual || alunosNaTurmaAtual.length === 0) return [];
+    // Filtra quem foi pulado hoje
+    const disponiveis = alunosNaTurmaAtual.filter(a => !alunosPulados.includes(a.user_id));
+    
+    const ordenados = [...disponiveis].sort((a, b) => {
+      const countA = a.fives_count || 0;
+      const countB = b.fives_count || 0;
+      if (countA !== countB) return countA - countB;
+      return a.name.localeCompare(b.name);
+    });
+    return ordenados.slice(0, turmaAtiva?.qtd_5s || 3);
+  };
+
+  const pularAluno5S = (alunoId: string, nomeAluno: string) => {
+    setAlunosPulados([...alunosPulados, alunoId]);
+    registrarAuditoria(`Pulou o aluno ${nomeAluno} no 5S (falta/dispensa)`);
+  };
+
+  const adicionarPontoManual = async (aluno: UserDB) => {
+    if (!confirm(`Deseja dar +1 no 5S para ${aluno.name} manualmente?`)) return;
+    await supabase.from("users").update({ fives_count: (aluno.fives_count || 0) + 1 }).eq("user_id", aluno.user_id);
+    registrarAuditoria(`Deu +1 manual no 5S para ${aluno.name}`);
+  };
+  
+  const confirmar5S = async () => {
+    if (isProcessing) return;
+    setIsProcessing(true);
+    try {
+      const escalaHoje = alunosPara5S();
+      const logsHistorico = [];
+      
+      for (const aluno of escalaHoje) {
+        // Dá o ponto no banco
+        await supabase.from("users").update({ fives_count: (aluno.fives_count || 0) + 1 }).eq("user_id", aluno.user_id);
+        
+        // Prepara o registro no histórico visível
+        logsHistorico.push({
+          user_id: aluno.user_id,
+          name: aluno.name,
+          status: "5s_history", // Novo status para salvar o histórico
+          description: `5S [TURMA:${turmaAtiva?.name}]`
+        });
+      }
+      
+      // Salva no banco de logs para todos verem e avisa a auditoria
+      if (logsHistorico.length > 0) await supabase.from("logs").insert(logsHistorico);
+      registrarAuditoria(`Confirmou e liberou o 5S da turma ${turmaAtiva?.name}`);
+      
+      // Reseta os alunos pulados para o próximo dia
+      setAlunosPulados([]);
+      alert("5S confirmado! Histórico salvo.");
+      if (turmaAtiva) await abrirFila(turmaAtiva);
+    } catch (error) {
+      alert("Erro ao confirmar 5S.");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Puxa o histórico dos últimos que fizeram o 5S
+  const historico5SDaTurma = historicoCompleto.filter(log => 
+    log.status === "5s_history" && log.description?.includes(`[TURMA:${turmaAtiva?.name}]`)
+  );
+
+  // ================= LÓGICA DO RESUMO DO DIA =================
+  const gerarResumoDoDia = () => {
+    const hoje = new Date().toLocaleDateString("pt-BR");
+    // Filtra o historico completo da turma (que já existe no seu código)
+    const logsHoje = historicoDaTurma.filter(log => {
+      if (log.status !== "concluido" || !log.go_time || !log.back_time) return false;
+      return new Date(log.go_time).toLocaleDateString("pt-BR") === hoje;
+    });
+  
+    const mapa: Record<string, { nome: string; idas: number; tempoTotal: number }> = {};
+  
+    logsHoje.forEach(log => {
+      const tempoMin = Math.round((new Date(log.back_time!).getTime() - new Date(log.go_time!).getTime()) / 60000);
+      if (!mapa[log.user_id]) mapa[log.user_id] = { nome: log.name, idas: 0, tempoTotal: 0 };
+      mapa[log.user_id].idas += 1;
+      mapa[log.user_id].tempoTotal += tempoMin;
+    });
+  
+    return Object.values(mapa)
+      .map(item => ({
+        ...item,
+        mediaTempo: item.idas > 0 ? Math.round(item.tempoTotal / item.idas) : 0
+      }))
+      .sort((a, b) => b.idas - a.idas);
+  };
+
   const [isHistoricoOpen, setIsHistoricoOpen] = useState(false);
 
   // ================= ESTADOS PARA RANKING COM BUSCA E RELATÓRIO =================
@@ -106,24 +208,58 @@ export default function Home() {
   const isPrivileged = currentUser?.acess_level === "Teacher" || currentUser?.acess_level === "admin";
   const isAdmin = currentUser?.acess_level === "admin";
 
+  // ================= ESTADOS EXTRAS DO 5S =================
+  const [alunosPulados, setAlunosPulados] = useState<string[]>([]);
+  const [mostrarHistorico5S, setMostrarHistorico5S] = useState(false);
+
+  // ================= AUDITORIA =================
+  const registrarAuditoria = async (acao: string) => {
+    if (!currentUser || currentUser.acess_level === "aluno") return;
+    await supabase.from("logs").insert([{
+      user_id: currentUser.user_id,
+      name: currentUser.name,
+      status: "auditoria",
+      description: acao
+    }]);
+  };
+
+  // ================= LIMPEZA DE LOGS LIXO (10 DIAS) =================
+  const limparLogsAntigos = async () => {
+    if (currentUser?.acess_level !== "admin") return;
+    const dezDiasAtras = new Date();
+    dezDiasAtras.setDate(dezDiasAtras.getDate() - 10);
+    
+    try {
+      await supabase.from("logs").delete().lt("require_time", dezDiasAtras.toISOString());
+    } catch (e) { console.error("Erro ao limpar logs:", e); }
+  };
+
+  // Roda a limpeza uma vez quando o admin entra
+  useEffect(() => {
+    if (currentUser?.acess_level === "admin") {
+      limparLogsAntigos();
+    }
+  }, [currentUser]);
+
   useEffect(() => { verificarLogin(); }, []);
 
   useEffect(() => {
     if (!currentUser) return;
 
-    const channel = supabase.channel("realtime_logs")
+    const channel = supabase.channel("realtime_dados")
       .on(
         "postgres_changes", 
         { event: "*", schema: "public", table: "logs" },
+        () => { carregarDados(currentUser); }
+      )
+      .on(
+        "postgres_changes", 
+        { event: "UPDATE", schema: "public", table: "classrooms" },
         (payload) => {
-          console.log("🔥 Mudança detectada no DB!", payload);
-          carregarDados(currentUser);
+          setTurmaAtiva((prev) => prev && prev.id === payload.new.id ? { ...prev, qtd_5s: payload.new.qtd_5s } : prev);
         }
       )
-      .subscribe((status) => {
-        console.log("📡 Status da Inscrição Realtime:", status);
-        // O status deve ser "SUBSCRIBED" se estiver tudo certo
-      });
+      .subscribe();
 
     return () => { 
       supabase.removeChannel(channel); 
@@ -446,11 +582,13 @@ export default function Home() {
       if (isPaused) {
         const pausaLog = logsDaTurmaAtiva.find(p => p.status === "pausado");
         if (pausaLog) await supabase.from("logs").update({ status: "concluido" }).eq("id", pausaLog.id);
-        criarLogAuditoria(`Liberou a fila da sala ${turmaAtiva.name}`);
+          criarLogAuditoria(`Liberou a fila da sala ${turmaAtiva.name}`);
       } else {
         await supabase.from("logs").insert([{ user_id: currentUser.user_id, name: "SISTEMA", status: "pausado", description: `Fila pausada por ${currentUser.name} [TURMA:${turmaAtiva.id}]` }]);
-        criarLogAuditoria(`Bloqueou a fila da sala ${turmaAtiva.name}`);
+          criarLogAuditoria(`Bloqueou a fila da sala ${turmaAtiva.name}`);
       }
+
+      registrarAuditoria(isPaused ? "Liberou a fila" : "Pausou a fila");
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
@@ -470,6 +608,7 @@ export default function Home() {
     try {
       await supabase.from("logs").update({ status: "pedido_historico" }).eq("id", pedido.id);
       await supabase.from("logs").insert([{ user_id: pedido.user_id, name: pedido.name, status: "saida", require_time: pedido.require_time, go_time: new Date().toISOString(), description: pedido.description }]);
+      if(isPrivileged) registrarAuditoria(`Liberou saída manual do aluno ${pedido.name}`);
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
@@ -525,6 +664,8 @@ export default function Home() {
       if(isPrivileged && currentUser?.user_id !== pedido.user_id) {
         criarLogAuditoria(`Removeu/Cancelou o registro de ${pedido.name}`);
       }
+
+      if(isPrivileged) registrarAuditoria(`Removeu da fila ou cancelou o pedido de ${pedido.name}`);
     }
     finally { processingRef.current = false; setIsProcessing(false); }
   };
@@ -1034,113 +1175,42 @@ export default function Home() {
             MÓDULO DE FILA DA TURMA
             ========================================================= */}
         {viewMode === "queue" && turmaAtiva && (
+          <>
           <div className="flex flex-col xl:flex-row gap-6 items-start animate-in fade-in slide-in-from-bottom-4 duration-500">
             
             {/* PAINEL RETRÁTIL ESQUERDO: RANKING */}
-            {isPrivileged && (
-              <div className={`bg-white border-2 border-[#00579D] shadow-md transition-all duration-300 ease-in-out overflow-hidden flex flex-col shrink-0 ${isStatsExpanded ? 'w-full xl:w-[380px]' : 'w-full xl:w-[72px]'} h-fit`}>
-                <button onClick={() => setIsStatsExpanded(!isStatsExpanded)} className="bg-[#00579D] text-white p-4 flex items-center justify-between w-full hover:bg-[#003E7E] transition-colors" title={isStatsExpanded ? "Fechar Resumo" : "Ver Resumo da Sala"}>
+            {/* PAINEL LATERAL ESQUERDO: RESUMO DA SALA (SOMENTE HOJE) */}
+              <div className={`transition-all duration-300 ease-in-out border-2 border-[#00579D] bg-white shadow-md flex flex-col ${isStatsExpanded ? 'w-full md:w-80' : 'w-16'}`}>
+                <button onClick={() => setIsStatsExpanded(!isStatsExpanded)} className="p-4 bg-[#00579D] text-white flex items-center justify-between hover:bg-[#003865] transition-colors" title={isStatsExpanded ? "Fechar Resumo" : "Ver Resumo de Hoje"}>
                   {isStatsExpanded ? <span className="font-bold uppercase tracking-widest text-sm flex items-center gap-2 whitespace-nowrap"><BarChart3 size={18} className="shrink-0"/> Resumo de Hoje</span> : <BarChart3 size={24} className="mx-auto shrink-0"/>}
                   {isStatsExpanded && <XCircle size={18} className="shrink-0" />}
                 </button>
+                
                 <div className={`transition-opacity duration-300 ${isStatsExpanded ? 'opacity-100 p-0' : 'opacity-0 h-0 overflow-hidden'}`}>
-
-                  {/* MODAL DE RELATÓRIO POR DIA */}
-                  {alunoRelatorio && (() => {
-                    const relatorio = gerarRelatorioAluno(alunoRelatorio);
-                    return (
-                      <div className="p-4 border-b-2 border-[#00579D] bg-blue-50">
-                        <div className="flex justify-between items-center mb-3">
-                          <div>
-                            <p className="text-[10px] font-black uppercase text-gray-400 tracking-widest">Relatório Semanal</p>
-                            <p className="font-extrabold text-[#00579D] uppercase text-sm truncate max-w-[220px]">{alunoRelatorio}</p>
-                          </div>
-                          <button onClick={() => setAlunoRelatorio(null)} className="text-gray-400 hover:text-red-600 transition-colors p-1">
-                            <XCircle size={18}/>
-                          </button>
-                        </div>
-                        {relatorio.length === 0 ? (
-                          <p className="text-center text-xs font-bold text-gray-400 uppercase py-4">Nenhum dado encontrado</p>
+                  {isStatsExpanded && (
+                    <div className="p-4 max-h-[600px] overflow-y-auto">
+                      <ul className="space-y-3">
+                        {gerarResumoDoDia().length === 0 ? (
+                          <p className="text-sm text-gray-500 font-bold text-center mt-4">Nenhum aluno foi ao banheiro hoje.</p>
                         ) : (
-                          <div className="space-y-2">
-                            {relatorio.map((dia) => (
-                              <div key={dia.diaNum} className="bg-white border-2 border-gray-200 p-3">
-                                <div className="flex justify-between items-center mb-1">
-                                  <p className="font-extrabold text-[#2B2B2B] uppercase text-xs">{dia.dia}</p>
-                                  <span className="text-[10px] font-black bg-[#00579D] text-white px-2 py-0.5">
-                                    {dia.idas} {dia.idas === 1 ? 'ida' : 'idas'}
-                                  </span>
-                                </div>
-                                <div className="flex justify-between text-[10px] font-bold text-gray-500 uppercase mb-2">
-                                  <span>Total: {dia.tempoTotal} min</span>
-                                  <span>Média: {dia.mediaTempo} min</span>
-                                </div>
-                                <div className="space-y-1">
-                                  {dia.registros.map((reg, idx) => (
-                                    <div key={idx} className="flex justify-between text-[10px] font-bold text-gray-400 bg-gray-50 px-2 py-1">
-                                      <span>{formatarHora(reg.goTime)} → {formatarHora(reg.backTime)}</span>
-                                      <span className={`font-black ${reg.tempoMin >= (turmaAtiva?.time_limit_minutes || 15) ? 'text-red-600' : 'text-gray-600'}`}>{reg.tempoMin} min</span>
-                                    </div>
-                                  ))}
-                                </div>
+                          gerarResumoDoDia().map((estatistica, idx) => (
+                            <li key={idx} className="flex justify-between items-center p-3 bg-[#F4F4F4] border-l-4 border-[#00579D]">
+                              <div>
+                                <p className="font-black text-[#2B2B2B] uppercase text-sm">{idx + 1}º {estatistica.nome}</p>
+                                <p className="text-xs font-bold text-[#00579D]">{estatistica.idas} {estatistica.idas === 1 ? 'ida' : 'idas'}</p>
                               </div>
-                            ))}
-                          </div>
+                              <div className="text-right">
+                                <p className="text-sm font-bold text-gray-700">{estatistica.tempoTotal} min</p>
+                                <p className="text-[10px] font-bold text-gray-400 uppercase">Média: {estatistica.mediaTempo} min</p>
+                              </div>
+                            </li>
+                          ))
                         )}
-                      </div>
-                    );
-                  })()}
-
-                  {/* BUSCA NO RANKING */}
-                  <div className="p-3 border-b-2 border-gray-200 bg-gray-50">
-                    <div className="relative">
-                      <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={14}/>
-                      <input
-                        type="text"
-                        placeholder="Buscar aluno..."
-                        className="w-full pl-8 pr-3 py-2 border-2 border-gray-300 focus:border-[#00579D] outline-none text-xs font-bold uppercase"
-                        value={buscaRanking}
-                        onChange={e => { setBuscaRanking(e.target.value); setAlunoRelatorio(null); }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* LISTA DO RANKING */}
-                  {(() => {
-                    const rankingFiltrado = rankingSala.filter(e =>
-                      e.nome.toLowerCase().includes(buscaRanking.toLowerCase())
-                    );
-                    return rankingFiltrado.length === 0 ? (
-                      <p className="p-6 text-center text-sm font-bold text-gray-400 uppercase">Nenhuma saída hoje</p>
-                    ) : (
-                      <ul className="divide-y divide-gray-200 max-h-[500px] overflow-y-auto">
-                        <li className="bg-gray-100 px-4 py-2 flex justify-between items-center text-[10px] font-black uppercase text-gray-500 tracking-widest">
-                          <span>Aluno (Idas hoje)</span>
-                          <span className="text-right">Total / Média</span>
-                        </li>
-                        {rankingFiltrado.map((estatistica, i) => (
-                          <li
-                            key={i}
-                            className={`p-4 flex justify-between items-center hover:bg-blue-50 cursor-pointer transition-colors ${alunoRelatorio === estatistica.nome ? 'bg-blue-50 border-l-4 border-[#00579D]' : ''}`}
-                            onClick={() => setAlunoRelatorio(alunoRelatorio === estatistica.nome ? null : estatistica.nome)}
-                            title="Clique para ver o relatório por dia"
-                          >
-                            <div>
-                              <p className="font-extrabold text-[#2B2B2B] uppercase text-sm">{estatistica.nome}</p>
-                              <p className="text-xs font-bold text-[#00579D]">{estatistica.idas} {estatistica.idas === 1 ? 'ida' : 'idas'}</p>
-                            </div>
-                            <div className="text-right">
-                              <p className="text-sm font-bold text-gray-700">{estatistica.tempoTotal} min</p>
-                              <p className="text-[10px] font-bold text-gray-400 uppercase">Média: {estatistica.mediaTempo} min</p>
-                            </div>
-                          </li>
-                        ))}
                       </ul>
-                    );
-                  })()}
+                    </div>
+                  )}
                 </div>
               </div>
-            )}
 
             {/* PAINEL CENTRAL / DIREITO: CONTEÚDO DA FILA */}
             <div className="flex-1 w-full space-y-6 min-w-0">
@@ -1502,6 +1572,86 @@ export default function Home() {
 
             </div>
           </div>
+          {/* PAINEL RETRÁTIL DO 5S (DIREITA) */}
+            {/* PAINEL RETRÁTIL DO 5S (DIREITA) COM HISTÓRICO E PULO */}
+            <div className="fixed right-0 top-[30%] z-50 flex items-start group">
+              <div className="bg-[#00579D] text-white p-2 rounded-l-lg shadow-lg cursor-pointer flex items-center justify-center min-h-[120px] border-y-2 border-l-2 border-[#2B2B2B]">
+                <span className="font-extrabold uppercase tracking-widest text-lg [writing-mode:vertical-lr] rotate-180">
+                  ESCALA 5S
+                </span>
+              </div>
+              
+              <div className="w-0 overflow-hidden bg-white group-hover:w-[350px] transition-all duration-300 ease-in-out shadow-2xl border-y-2 border-[#2B2B2B] -ml-1 h-auto min-h-[120px] flex flex-col max-h-[80vh]">
+                
+                {/* Abas Superiores */}
+                <div className="flex border-b-2 border-gray-200 bg-gray-50">
+                  <button onClick={() => setMostrarHistorico5S(false)} className={`flex-1 py-3 font-bold uppercase text-xs tracking-widest ${!mostrarHistorico5S ? "bg-[#00579D] text-white" : "text-gray-500 hover:bg-gray-200"}`}>Hoje</button>
+                  <button onClick={() => setMostrarHistorico5S(true)} className={`flex-1 py-3 font-bold uppercase text-xs tracking-widest ${mostrarHistorico5S ? "bg-[#00579D] text-white" : "text-gray-500 hover:bg-gray-200"}`}>Histórico</button>
+                </div>
+
+                <div className="p-5 w-[350px] overflow-y-auto">
+                  
+                  {!mostrarHistorico5S ? (
+                    <>
+                      <h3 className="text-xl font-extrabold uppercase text-[#00579D] pb-2 mb-4">Quem Limpa Hoje?</h3>
+                      
+                      {isPrivileged && (
+                        <div className="mb-4 flex items-center justify-between bg-gray-50 p-2 border border-gray-200 rounded">
+                          <label className="text-xs font-bold text-gray-600 uppercase">Alunos (Qtd):</label>
+                          <input type="number" min="1" max={alunosNaTurmaAtual?.length || 10} value={turmaAtiva?.qtd_5s || 3} onChange={(e) => alterarQtd5S(Number(e.target.value))} className="w-16 p-1 border-2 border-gray-300 font-bold text-center text-[#00579D]"/>
+                        </div>
+                      )}
+
+                      <ul className="space-y-2 mb-4">
+                        {alunosPara5S().map((aluno, idx) => (
+                          <li key={aluno.user_id} className="p-2 bg-gray-50 border-l-4 border-[#00579D] flex flex-col gap-2 shadow-sm">
+                            <div className="flex justify-between items-center">
+                              <span className="font-bold text-sm text-[#2B2B2B] truncate">{idx + 1}. {aluno.name}</span>
+                              <span className="text-[10px] text-gray-500 font-bold bg-gray-200 px-2 py-1 rounded">({aluno.fives_count || 0}x)</span>
+                            </div>
+                            
+                            {/* Botões do Professor (Pular aluno que faltou ou dar +1 manual) */}
+                            {isPrivileged && (
+                              <div className="flex gap-2 w-full mt-1">
+                                <button onClick={() => pularAluno5S(aluno.user_id, aluno.name)} className="flex-1 bg-yellow-100 text-yellow-700 border border-yellow-300 hover:bg-yellow-200 text-[10px] font-bold uppercase py-1 rounded">
+                                  Faltou/Pular
+                                </button>
+                                <button onClick={() => adicionarPontoManual(aluno)} className="flex-1 bg-blue-100 text-blue-700 border border-blue-300 hover:bg-blue-200 text-[10px] font-bold uppercase py-1 rounded">
+                                  Dar +1
+                                </button>
+                              </div>
+                            )}
+                          </li>
+                        ))}
+                        {alunosPara5S().length === 0 && <p className="text-sm text-gray-500 text-center font-bold">Ninguém disponível.</p>}
+                      </ul>
+
+                      {isPrivileged && alunosPara5S().length > 0 && (
+                        <button onClick={confirmar5S} disabled={isProcessing} className="w-full bg-green-600 text-white font-bold uppercase py-3 hover:bg-green-700 shadow-md text-xs tracking-widest flex items-center justify-center gap-2 border-b-4 border-green-800 active:border-b-0 active:translate-y-1">
+                          <CheckCircle2 size={16}/> Confirmar e Liberar
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <h3 className="text-xl font-extrabold uppercase text-[#00579D] pb-2 mb-4">Últimas Limpezas</h3>
+                      <ul className="space-y-3">
+                        {historico5SDaTurma.length === 0 ? (
+                          <p className="text-xs text-gray-500 font-bold text-center">Nenhum histórico registrado.</p>
+                        ) : (
+                          historico5SDaTurma.slice(0, 15).map(log => (
+                            <li key={log.id} className="text-xs font-bold border-b border-gray-100 pb-2">
+                              <span className="text-[#00579D]">{new Date(log.require_time).toLocaleDateString("pt-BR")}</span> - <span className="text-[#2B2B2B]">{log.name}</span>
+                            </li>
+                          ))
+                        )}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+            </>
         )}
 
       </div>
