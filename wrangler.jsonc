@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "main": ".open-next/worker.js",
-  "name": "fila-banheiro",
+  "name": "sgt",
   "compatibility_date": "2025-09-27",
   "compatibility_flags": [
     "nodejs_compat"
