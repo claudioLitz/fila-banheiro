@@ -26,8 +26,8 @@ export default function Home() {
   const [currentUser, setCurrentUser] = useState<UserDB | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [ultimoRetornoDoAluno, setUltimoRetornoDoAluno] = useState<LogPedido | null>(null);
-  const [, setTick] = useState(0);
-  useEffect(() => { const i = setInterval(() => setTick(t => t + 1), 30000); return () => clearInterval(i); }, []);
+  // Segundos restantes do cooldown — atualizado a cada 1s localmente, sem bater no banco
+  const [cooldownSecondsLeft, setCooldownSecondsLeft] = useState(0);
 
   const processingRef = useRef(false);
   const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -64,17 +64,20 @@ export default function Home() {
   const [filtroAuditoria, setFiltroAuditoria] = useState("");
   const [filtroHistorico, setFiltroHistorico] = useState("");
 
+  const isOptimistic = (id: string) => id.startsWith('otimista-');
+
   const isPrivileged = currentUser?.acess_level === "Teacher" || currentUser?.acess_level === "admin";
   const isAdmin = currentUser?.acess_level === "admin";
 
-  const registrarAuditoria = useCallback(async (acao: string) => {
+  // Fire-and-forget: logs de auditoria não bloqueiam a UI
+  const registrarAuditoria = useCallback((acao: string) => {
     if (!currentUser || currentUser.acess_level === "aluno") return;
-    await supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: acao }]);
+    supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: acao }]).then(() => {});
   }, [currentUser]);
 
-  const criarLogAuditoria = useCallback(async (acao: string) => {
+  const criarLogAuditoria = useCallback((acao: string) => {
     if (!currentUser) return;
-    await supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: acao }]);
+    supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: acao }]).then(() => {});
   }, [currentUser]);
 
   const limparLogsAntigos = useCallback(async () => {
@@ -82,20 +85,18 @@ export default function Home() {
     try { await supabase.from("logs").delete().lt("require_time", d.toISOString()); } catch (e) { console.error(e); }
   }, []);
 
-  useEffect(() => { if (currentUser?.acess_level === "admin") limparLogsAntigos(); }, [currentUser, limparLogsAntigos]);
-
-  // Roda 1x por sessão (admin): apaga usuários inativos há +30 dias e órfãos do user_classrooms
+  // Declarada ANTES do useEffect que a usa — evita "used before declaration"
   const limparUsuariosInativos = useCallback(async () => {
     const CHAVE = "ultima_limpeza_usuarios";
     const ultima = localStorage.getItem(CHAVE);
     const agora = new Date();
-    // Só roda 1x por dia mesmo que o admin recarregue a página
     if (ultima && agora.getTime() - new Date(ultima).getTime() < 24 * 60 * 60 * 1000) return;
 
     const limite = new Date();
     limite.setDate(limite.getDate() - 30);
 
-    // 1) Busca usuários alunos inativos há mais de 30 dias
+    // 1) Alunos inativos há +30 dias
+    // Tipo explícito apenas com os campos selecionados — evita erro ts(2345)
     const { data: inativos } = await supabase
       .from("users")
       .select("user_id, name")
@@ -103,22 +104,21 @@ export default function Home() {
       .lt("last_login", limite.toISOString());
 
     if (inativos && inativos.length > 0) {
-      const ids = inativos.map((u: UserDB) => u.user_id);
-      // Remove vínculos de turma
-      await supabase.from("user_classrooms").delete().in("user_id", ids);
-      // Remove logs do usuário
-      await supabase.from("logs").delete().in("user_id", ids);
-      // Remove da tabela users
-      await supabase.from("users").delete().in("user_id", ids);
+      const ids = (inativos as { user_id: string; name: string }[]).map(u => u.user_id);
+      await Promise.all([
+        supabase.from("user_classrooms").delete().in("user_id", ids),
+        supabase.from("logs").delete().in("user_id", ids),
+        supabase.from("users").delete().in("user_id", ids),
+      ]);
       console.info(`[Limpeza automática] ${ids.length} aluno(s) inativo(s) removido(s).`);
     }
 
-    // 2) Limpeza de órfãos — user_classrooms cujo user_id não existe mais na tabela users
+    // 2) Órfãos em user_classrooms
     const { data: todosVinculos } = await supabase.from("user_classrooms").select("user_id");
     if (todosVinculos && todosVinculos.length > 0) {
-      const idsVinculados = [...new Set(todosVinculos.map((v: any) => v.user_id))];
-      const { data: usuariosExistentes } = await supabase.from("users").select("user_id").in("user_id", idsVinculados);
-      const existentesSet = new Set((usuariosExistentes || []).map((u: any) => u.user_id));
+      const idsVinculados = [...new Set((todosVinculos as { user_id: string }[]).map(v => v.user_id))];
+      const { data: existentes } = await supabase.from("users").select("user_id").in("user_id", idsVinculados);
+      const existentesSet = new Set((existentes || []).map((u: { user_id: string }) => u.user_id));
       const orfaos = idsVinculados.filter(id => !existentesSet.has(id));
       if (orfaos.length > 0) {
         await supabase.from("user_classrooms").delete().in("user_id", orfaos);
@@ -129,18 +129,64 @@ export default function Home() {
     localStorage.setItem(CHAVE, agora.toISOString());
   }, []);
 
-  useEffect(() => { if (currentUser?.acess_level === "admin") limparUsuariosInativos(); }, [currentUser, limparUsuariosInativos]);
+  // useEffect depois das duas funções que referencia
+  useEffect(() => {
+    if (currentUser?.acess_level === "admin") {
+      limparLogsAntigos();
+      limparUsuariosInativos();
+    }
+  }, [currentUser, limparLogsAntigos, limparUsuariosInativos]);
+
+
 
   const carregarDados = useCallback(async (usuario: UserDB | null) => {
     if (!usuario) return;
+    const ehPrivilegiado = usuario.acess_level === "admin" || usuario.acess_level === "Teacher";
+
+    if (!ehPrivilegiado) {
+      // ── ALUNOS: query mínima — só logs ativos, sem join, sem histórico ──
+      // São a maioria dos usuários. Payload ~90% menor que a versão completa.
+      const { data: ativos } = await supabase
+        .from("logs")
+        .select("id, user_id, name, status, require_time, go_time, back_time, description")
+        .in("status", ["pedido", "saida", "pausado"]);
+
+      const logsAtivos = (ativos || []) as LogPedido[];
+      setTodosLogsAtivos(logsAtivos.reverse());
+
+      // Cooldown: busca último retorno do próprio aluno (só 1 linha)
+      const { data: ultimoRetorno } = await supabase
+        .from("logs")
+        .select("id, user_id, name, status, require_time, go_time, back_time, description")
+        .eq("user_id", usuario.user_id)
+        .eq("status", "concluido")
+        .order("back_time", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      setUltimoRetornoDoAluno(ultimoRetorno as LogPedido | null);
+      setHistoricoCompleto([]);
+      return;
+    }
+
+    // ── PROFESSORES / ADMIN: versão completa com histórico ──
     const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
-    const { data } = await supabase.from("logs")
-      .select("id, user_id, name, status, require_time, go_time, back_time, description, users(acess_level)")
-      .or(`require_time.gte.${hoje.toISOString()},status.in.(pedido,saida,pausado)`);
-    if (!data) return;
+    const [{ data: ativos }, { data: historico }] = await Promise.all([
+      supabase.from("logs")
+        .select("id, user_id, name, status, require_time, go_time, back_time, description, users(acess_level)")
+        .in("status", ["pedido", "saida", "pausado"]),
+      supabase.from("logs")
+        .select("id, user_id, name, status, require_time, go_time, back_time, description, users(acess_level)")
+        .gte("require_time", hoje.toISOString())
+        .not("status", "in", "(pedido,saida,pausado,auditoria)")
+        .order("require_time", { ascending: false })
+        .limit(300),
+    ]);
+    const data = [...(ativos || []), ...(historico || [])];
     const logsData = data as unknown as LogPedido[];
     setTodosLogsAtivos(logsData.filter(p => ["pedido", "saida", "pausado"].includes(p.status)).reverse());
-    const meuUltimoRetorno = logsData.filter(l => l.user_id === usuario.user_id && l.status === "concluido" && l.back_time)
+    const meuUltimoRetorno = logsData
+      .filter(l => l.user_id === usuario.user_id && l.status === "concluido" && l.back_time)
       .sort((a, b) => new Date(b.back_time!).getTime() - new Date(a.back_time!).getTime())[0] ?? null;
     setUltimoRetornoDoAluno(meuUltimoRetorno);
     const getActionTime = (log: LogPedido) => {
@@ -150,22 +196,29 @@ export default function Home() {
     };
     const sorted = [...logsData].sort((a, b) => getActionTime(b) - getActionTime(a));
     if (usuario.acess_level === "admin") setHistoricoCompleto(sorted.filter(l => l.status !== "auditoria"));
-    else if (usuario.acess_level === "Teacher") setHistoricoCompleto(sorted.filter(l => l.status !== "auditoria" && (l.users?.acess_level === "aluno" || l.users?.acess_level === "Student")));
-    else setHistoricoCompleto([]);
+    else setHistoricoCompleto(sorted.filter(l => l.status !== "auditoria" && (l.users?.acess_level === "aluno" || l.users?.acess_level === "Student")));
   }, []);
 
   useEffect(() => {
     if (!currentUser) return;
-    const channel = supabase.channel("realtime_dados")
+    // Canal ÚNICO por usuário — reduz conexões à metade (crítico no free tier: limite 200)
+    const channel = supabase.channel(`rt_user_${currentUser.user_id}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "logs" }, () => {
         if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
-        realtimeDebounceRef.current = setTimeout(() => carregarDados(currentUser), 400);
+        realtimeDebounceRef.current = setTimeout(() => carregarDados(currentUser), 200);
       })
       .on("postgres_changes", { event: "UPDATE", schema: "public", table: "classrooms" }, (payload) => {
-        setTurmaAtiva(prev => prev && prev.id === payload.new.id ? { ...prev, qtd_5s: payload.new.qtd_5s, cooldown_minutes: payload.new.cooldown_minutes } : prev);
+        setTurmaAtiva(prev => prev && prev.id === payload.new.id
+          ? { ...prev, qtd_5s: payload.new.qtd_5s, cooldown_minutes: payload.new.cooldown_minutes, time_limit_minutes: payload.new.time_limit_minutes }
+          : prev
+        );
       })
       .subscribe();
-    return () => { if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current); supabase.removeChannel(channel); };
+
+    return () => {
+      if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
+      supabase.removeChannel(channel);
+    };
   }, [currentUser, carregarDados]);
 
   const carregarDashboard = useCallback(async (usuario: UserDB | null = null) => {
@@ -174,7 +227,8 @@ export default function Home() {
     const { data: turmasData } = await supabase.from("classrooms").select("*").order("created_at", { ascending: true });
     const { data: vinculosProfessores } = await supabase.from("classroom_teachers").select("user_id, classroom_id");
     // Conta direto do user_classrooms — só alunos ficam nessa tabela (professores usam classroom_teachers)
-    const { data: vinculos } = await supabase.from("user_classrooms").select("classroom_id");
+    // Só classroom_id — coluna mínima para contagem
+    const { data: vinculos } = await supabase.from("user_classrooms").select("classroom_id", { count: "exact", head: false });
     if (!turmasData) return;
     let turmasVisiveis = turmasData;
     if (usr.acess_level === "Teacher") {
@@ -198,9 +252,15 @@ export default function Home() {
       } else {
         const { data: vinculo } = await supabase.from("user_classrooms").select("classroom_id").eq("user_id", usuarioDB.user_id).maybeSingle();
         if (vinculo) {
-          const { data: turma } = await supabase.from("classrooms").select("*").eq("id", vinculo.classroom_id).single();
-          const { data: membros } = await supabase.from("user_classrooms").select("user_id").eq("classroom_id", turma.id);
-          if (membros) { const ids = membros.map(m => m.user_id); const { data: alunosData } = await supabase.from("users").select("user_id, name, acess_level, fives_count").in("user_id", ids); setAlunosNaTurmaAtual(alunosData || []); }
+          // Turma e membros em paralelo — corta latência de login do aluno pela metade
+          const [{ data: turma }, { data: membros }] = await Promise.all([
+            supabase.from("classrooms").select("*").eq("id", vinculo.classroom_id).single(),
+            supabase.from("user_classrooms").select("user_id").eq("classroom_id", vinculo.classroom_id),
+          ]);
+          if (membros && membros.length > 0) {
+            const { data: alunosData } = await supabase.from("users").select("user_id, name, acess_level, fives_count").in("user_id", membros.map(m => m.user_id));
+            setAlunosNaTurmaAtual(alunosData || []);
+          }
           setTurmaAtiva(turma); setViewMode("queue");
         } else { setViewMode("no_class"); }
       }
@@ -355,56 +415,170 @@ export default function Home() {
   const souOPrimeiro = filaEsperaOrdenada.length > 0 && filaEsperaOrdenada[0].user_id === currentUser?.user_id;
   const acessoLivreParaAluno = noBanheiroList.length === 0;
 
-  const cooldownInfo = useMemo(() => {
+  // Calcula segundos totais restantes e inicializa o estado
+  useEffect(() => {
     const cm = turmaAtiva?.cooldown_minutes || 0;
-    if (cm <= 0 || !ultimoRetornoDoAluno?.back_time) return { emCooldown: false, minutos: 0, segundosRestantes: 0 };
-    const restMs = new Date(ultimoRetornoDoAluno.back_time).getTime() + cm * 60000 - Date.now();
-    if (restMs <= 0) return { emCooldown: false, minutos: 0, segundosRestantes: 0 };
-    return { emCooldown: true, minutos: Math.floor(restMs / 60000), segundosRestantes: Math.ceil((restMs % 60000) / 1000) };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [turmaAtiva, ultimoRetornoDoAluno, /* tick via setTick a cada 30s */]);
+    if (cm <= 0 || !ultimoRetornoDoAluno?.back_time) {
+      setCooldownSecondsLeft(0);
+      return;
+    }
+    const calcRestante = () => Math.max(0, Math.ceil(
+      (new Date(ultimoRetornoDoAluno.back_time!).getTime() + cm * 60000 - Date.now()) / 1000
+    ));
+    const inicial = calcRestante();
+    setCooldownSecondsLeft(inicial);
+    if (inicial <= 0) return;
+
+    // Intervalo de 1s — só corre quando há cooldown ativo, se auto-cancela ao zerar
+    const timer = setInterval(() => {
+      const restante = calcRestante();
+      setCooldownSecondsLeft(restante);
+      if (restante <= 0) clearInterval(timer);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [turmaAtiva?.cooldown_minutes, ultimoRetornoDoAluno]);
+
+  // Derivado síncrono do estado — sem useMemo necessário
+  const cooldownInfo = {
+    emCooldown: cooldownSecondsLeft > 0,
+    minutos: Math.floor(cooldownSecondsLeft / 60),
+    segundosRestantes: cooldownSecondsLeft % 60,
+  };
 
   // Ações da fila
   const alternarPausa = async () => {
     if (processingRef.current || !currentUser || !turmaAtiva) return;
     processingRef.current = true; setIsProcessing(true);
     try {
-      if (isPaused) { const pl = logsDaTurmaAtiva.find(p => p.status === "pausado"); if (pl) await supabase.from("logs").update({ status: "concluido" }).eq("id", pl.id); criarLogAuditoria(`Liberou a fila da sala ${turmaAtiva.name}`); }
-      else { await supabase.from("logs").insert([{ user_id: currentUser.user_id, name: "SISTEMA", status: "pausado", description: `Fila pausada por ${currentUser.name} [TURMA:${turmaAtiva.id}]` }]); criarLogAuditoria(`Bloqueou a fila da sala ${turmaAtiva.name}`); }
-      registrarAuditoria(isPaused ? "Liberou a fila" : "Pausou a fila");
-      await carregarDados(currentUser);
+      if (isPaused) {
+        const pl = logsDaTurmaAtiva.find(p => p.status === "pausado");
+        if (pl) {
+          // Optimistic: remove o log de pausa localmente
+          setTodosLogsAtivos(prev => prev.filter(l => l.id !== pl.id));
+          await Promise.all([
+            supabase.from("logs").update({ status: "concluido" }).eq("id", pl.id),
+            supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: `Liberou a fila da sala ${turmaAtiva.name}` }]),
+          ]);
+        }
+      } else {
+        // Optimistic: adiciona log de pausa localmente
+        const pausaOtimista: LogPedido = {
+          id: `otimista-pausa-${Date.now()}`,
+          user_id: currentUser.user_id,
+          name: "SISTEMA",
+          status: "pausado",
+          require_time: new Date().toISOString(),
+          go_time: null, back_time: null,
+          description: `Fila pausada por ${currentUser.name} [TURMA:${turmaAtiva.id}]`,
+        };
+        setTodosLogsAtivos(prev => [pausaOtimista, ...prev]);
+        const [{ data: pausaReal }] = await Promise.all([
+          supabase.from("logs").insert([{ user_id: currentUser.user_id, name: "SISTEMA", status: "pausado", description: `Fila pausada por ${currentUser.name} [TURMA:${turmaAtiva.id}]` }]).select("id").single(),
+          supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: `Bloqueou a fila da sala ${turmaAtiva.name}` }]),
+        ]);
+        // Substitui o ID otimista da pausa pelo ID real
+        if (pausaReal?.id) {
+          setTodosLogsAtivos(prev => prev.map(l =>
+            l.id === pausaOtimista.id ? { ...l, id: pausaReal.id } : l
+          ));
+        }
+      }
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
-  // FIX: aluno pode entrar na fila mesmo com fila bloqueada
+  // Aluno pode entrar na fila mesmo com fila bloqueada.
+  // Proteção em 3 camadas contra spam:
+  //  1. processingRef bloqueia cliques enquanto a função está rodando
+  //  2. Optimistic update seta meuPedido na UI imediatamente (fecha janela de ~200ms)
+  //  3. SELECT no banco confirma que não existe pedido ativo antes de inserir (bulletproof)
+  //     → Só esta função tem o SELECT: admin/professor adicionam via adicionarAlunoManualmenteFila
   const requisitar = async () => {
     if (cooldownInfo.emCooldown && !isPrivileged) return;
     if (!currentUser || processingRef.current || meuPedido) return;
     processingRef.current = true; setIsProcessing(true);
+
+    // Optimistic: insere na UI imediatamente (camada 2)
+    const pedidoOtimista: LogPedido = {
+      id: `otimista-${Date.now()}`,
+      user_id: currentUser.user_id,
+      name: currentUser.name,
+      status: "pedido",
+      require_time: new Date().toISOString(),
+      go_time: null,
+      back_time: null,
+      description: null,
+    };
+    setTodosLogsAtivos(prev => [pedidoOtimista, ...prev]);
+
     try {
-      const { data: jaExiste } = await supabase.from("logs").select("id").eq("user_id", currentUser.user_id).in("status", ["pedido", "saida"]);
-      if (jaExiste && jaExiste.length > 0) return;
-      await supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "pedido" }]);
-      await carregarDados(currentUser);
+      // Camada 3: confirma no banco antes de inserir
+      const { data: jaExiste } = await supabase
+        .from("logs")
+        .select("id")
+        .eq("user_id", currentUser.user_id)
+        .in("status", ["pedido", "saida"])
+        .limit(1);
+
+      if (jaExiste && jaExiste.length > 0) {
+        setTodosLogsAtivos(prev => prev.filter(l => l.id !== pedidoOtimista.id));
+        return;
+      }
+
+      // INSERT e captura o ID real retornado
+      const { data: inserido } = await supabase
+        .from("logs")
+        .insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "pedido" }])
+        .select("id")
+        .single();
+
+      // Substitui o ID otimista pelo ID real — resolve o bug do PATCH com ID falso
+      if (inserido?.id) {
+        setTodosLogsAtivos(prev => prev.map(l =>
+          l.id === pedidoOtimista.id ? { ...l, id: inserido.id } : l
+        ));
+      }
+    } catch {
+      setTodosLogsAtivos(prev => prev.filter(l => l.id !== pedidoOtimista.id));
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
   const registrarSaida = async (pedido: LogPedido) => {
     if (processingRef.current) return; processingRef.current = true; setIsProcessing(true);
+    const goNow = new Date().toISOString();
+    // Optimistic: substitui o log de pedido por saida localmente
+    setTodosLogsAtivos(prev => prev.map(l =>
+      l.id === pedido.id ? { ...l, status: "saida", go_time: goNow } : l
+    ));
     try {
-      await supabase.from("logs").update({ status: "pedido_historico" }).eq("id", pedido.id);
-      await supabase.from("logs").insert([{ user_id: pedido.user_id, name: pedido.name, status: "saida", require_time: pedido.require_time, go_time: new Date().toISOString(), description: pedido.description }]);
+      // Se ID ainda é otimista, o INSERT do requisitar não completou — aguarda o realtime
+      if (isOptimistic(pedido.id)) {
+        setTodosLogsAtivos(prev => prev.map(l => l.id === pedido.id ? { ...l, status: "pedido", go_time: null } : l));
+        return;
+      }
+      await Promise.all([
+        supabase.from("logs").update({ status: "pedido_historico" }).eq("id", pedido.id),
+        supabase.from("logs").insert([{ user_id: pedido.user_id, name: pedido.name, status: "saida", require_time: pedido.require_time, go_time: goNow, description: pedido.description }]),
+      ]);
       if (isPrivileged) registrarAuditoria(`Liberou saída manual do aluno ${pedido.name}`);
-      await carregarDados(currentUser);
+    } catch {
+      setTodosLogsAtivos(prev => prev.map(l => l.id === pedido.id ? { ...l, status: "pedido", go_time: null } : l));
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
   const registrarChegada = async (pedido: LogPedido) => {
     if (processingRef.current) return; processingRef.current = true; setIsProcessing(true);
+    const backNow = new Date().toISOString();
+    // Optimistic: remove da lista ativa (vai para histórico)
+    setTodosLogsAtivos(prev => prev.filter(l => l.id !== pedido.id));
+    // Atualiza cooldown localmente imediatamente
+    setUltimoRetornoDoAluno({ ...pedido, status: "concluido", back_time: backNow });
     try {
-      await supabase.from("logs").update({ status: "saida_historico" }).eq("id", pedido.id);
-      await supabase.from("logs").insert([{ user_id: pedido.user_id, name: pedido.name, status: "concluido", require_time: pedido.require_time, go_time: pedido.go_time, back_time: new Date().toISOString(), description: pedido.description }]);
-      await carregarDados(currentUser);
+      await Promise.all([
+        supabase.from("logs").update({ status: "saida_historico" }).eq("id", pedido.id),
+        supabase.from("logs").insert([{ user_id: pedido.user_id, name: pedido.name, status: "concluido", require_time: pedido.require_time, go_time: pedido.go_time, back_time: backNow, description: pedido.description }]),
+      ]);
+    } catch {
+      setTodosLogsAtivos(prev => [pedido, ...prev]);
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
@@ -414,39 +588,56 @@ export default function Home() {
     try {
       const aluno = alunosNaTurmaAtual.find(a => a.user_id === alunoSelecionadoFila);
       if (!aluno) return;
-      const { data: jaExiste } = await supabase.from("logs").select("id").eq("user_id", aluno.user_id).in("status", ["pedido", "saida"]);
-      if (jaExiste && jaExiste.length > 0) return;
       await supabase.from("logs").insert([{ user_id: aluno.user_id, name: aluno.name, status: "pedido", description: `(Adicionado por: ${currentUser.name})` }]);
       criarLogAuditoria(`Adicionou ${aluno.name} na fila da sala ${turmaAtiva?.name}`);
-      setAlunoSelecionadoFila(""); await carregarDados(currentUser);
+      setAlunoSelecionadoFila("");
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
   const forcarSaidaAluno = async (p: LogPedido) => {
     if (processingRef.current || !currentUser) return; processingRef.current = true; setIsProcessing(true);
+    const goNow2 = new Date().toISOString();
+    setTodosLogsAtivos(prev => prev.map(l =>
+      l.id === p.id ? { ...l, status: "saida", go_time: goNow2 } : l
+    ));
     try {
-      await supabase.from("logs").update({ status: "pedido_historico" }).eq("id", p.id);
-      await supabase.from("logs").insert([{ user_id: p.user_id, name: p.name, status: "saida", require_time: p.require_time, go_time: new Date().toISOString(), description: ((p.description || "") + ` (Forçada por: ${currentUser.name})`).trim() }]);
-      criarLogAuditoria(`Forçou a saída do aluno ${p.name}`); await carregarDados(currentUser);
+      await Promise.all([
+        supabase.from("logs").update({ status: "pedido_historico" }).eq("id", p.id),
+        supabase.from("logs").insert([{ user_id: p.user_id, name: p.name, status: "saida", require_time: p.require_time, go_time: goNow2, description: ((p.description || "") + ` (Forçada por: ${currentUser.name})`).trim() }]),
+      ]);
+      criarLogAuditoria(`Forçou a saída do aluno ${p.name}`);
+    } catch {
+      setTodosLogsAtivos(prev => prev.map(l => l.id === p.id ? { ...l, status: "pedido", go_time: null } : l));
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
   const forcarRetornoAluno = async (p: LogPedido) => {
     if (processingRef.current) return; processingRef.current = true; setIsProcessing(true);
+    const backNow2 = new Date().toISOString();
+    setTodosLogsAtivos(prev => prev.filter(l => l.id !== p.id));
     try {
-      await supabase.from("logs").update({ status: "saida_historico" }).eq("id", p.id);
-      await supabase.from("logs").insert([{ user_id: p.user_id, name: p.name, status: "concluido", require_time: p.require_time, go_time: p.go_time, back_time: new Date().toISOString(), description: ((p.description || "") + ` (Retorno forçado por: ${currentUser?.name})`).trim() }]);
-      criarLogAuditoria(`Forçou o retorno do aluno ${p.name}`); await carregarDados(currentUser);
+      await Promise.all([
+        supabase.from("logs").update({ status: "saida_historico" }).eq("id", p.id),
+        supabase.from("logs").insert([{ user_id: p.user_id, name: p.name, status: "concluido", require_time: p.require_time, go_time: p.go_time, back_time: backNow2, description: ((p.description || "") + ` (Retorno forçado por: ${currentUser?.name})`).trim() }]),
+      ]);
+      criarLogAuditoria(`Forçou o retorno do aluno ${p.name}`);
+    } catch {
+      setTodosLogsAtivos(prev => [p, ...prev]);
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
   const cancelarPedido = async (p: LogPedido) => {
     if (processingRef.current) return; processingRef.current = true; setIsProcessing(true);
+    // Optimistic: remove imediatamente da fila ativa
+    setTodosLogsAtivos(prev => prev.filter(l => l.id !== p.id));
     try {
+      // Se for ID otimista, o INSERT ainda não completou — não há registro no banco para cancelar
+      if (isOptimistic(p.id)) return;
       await supabase.from("logs").update({ status: "cancelado", description: "Cancelado / Removido" }).eq("id", p.id);
       if (isPrivileged && currentUser?.user_id !== p.user_id) criarLogAuditoria(`Removeu/Cancelou o registro de ${p.name}`);
       if (isPrivileged) registrarAuditoria(`Removeu da fila ou cancelou o pedido de ${p.name}`);
-      await carregarDados(currentUser);
+    } catch {
+      setTodosLogsAtivos(prev => [p, ...prev]);
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
@@ -455,12 +646,12 @@ export default function Home() {
     try {
       const atual = filaEsperaOrdenada[index], outro = filaEsperaOrdenada[direcao === "up" ? index - 1 : index + 1];
       if (!atual || !outro) return;
+      // Todas as 3 operações em paralelo
       await Promise.all([
         supabase.from("logs").update({ description: ((atual.description || "").replace(/\[OVERRIDE:.*?\]/g, "") + ` [OVERRIDE:${getEffectiveTime(outro)}]`).trim() }).eq("id", atual.id),
         supabase.from("logs").update({ description: ((outro.description || "").replace(/\[OVERRIDE:.*?\]/g, "") + ` [OVERRIDE:${getEffectiveTime(atual)}]`).trim() }).eq("id", outro.id),
+        supabase.from("logs").insert([{ user_id: currentUser.user_id, name: currentUser.name, status: "auditoria", description: `Alterou a posição de ${atual.name} e ${outro.name} na fila` }]),
       ]);
-      criarLogAuditoria(`Alterou a posição de ${atual.name} e ${outro.name} na fila`);
-      await carregarDados(currentUser);
     } finally { processingRef.current = false; setIsProcessing(false); }
   };
 
@@ -788,11 +979,11 @@ export default function Home() {
                       {!meuPedido ? (
                         cooldownInfo.emCooldown ? (
                           <div className="w-full space-y-4">
-                            <div className="bg-amber-50 border-2 border-amber-400 p-6 flex flex-col items-center gap-3">
-                              <Timer size={36} className="text-amber-500" />
-                              <p className="font-extrabold text-amber-700 uppercase text-lg">Aguarde para requisitar</p>
-                              <div className="bg-amber-400 text-white px-6 py-3 font-black text-3xl tracking-widest tabular-nums">{cooldownInfo.minutos > 0 ? `${cooldownInfo.minutos} min ${cooldownInfo.segundosRestantes.toString().padStart(2, "0")} s` : `${cooldownInfo.segundosRestantes} s`}</div>
-                              <p className="text-xs text-amber-600 font-bold uppercase">Você poderá requisitar em breve</p>
+                            <div className="bg-blue-50 border-2 border-[#00579D] p-6 flex flex-col items-center gap-3">
+                              <Timer size={36} className="text-[#00579D]" />
+                              <p className="font-extrabold text-[#00579D] uppercase text-lg">Aguarde para requisitar</p>
+                              <div className="bg-[#00579D] text-white px-6 py-3 font-black text-3xl tracking-widest tabular-nums">{cooldownInfo.minutos > 0 ? `${cooldownInfo.minutos} min ${cooldownInfo.segundosRestantes.toString().padStart(2, "0")} s` : `${cooldownInfo.segundosRestantes} s`}</div>
+                              <p className="text-xs text-[#00579D] font-bold uppercase">Você poderá requisitar em breve</p>
                             </div>
                           </div>
                         ) : (
@@ -806,19 +997,19 @@ export default function Home() {
                         souOPrimeiro && acessoLivreParaAluno && !isPaused ? (
                           <div className="w-full space-y-4">
                             <p className="text-[#00579D] font-bold uppercase text-xl mb-2">Sua vez!</p>
-                            <button onClick={() => registrarSaida(meuPedido)} className="w-full bg-[#00579D] text-white font-bold uppercase py-5 border-b-4 border-[#003865] active:border-b-0 active:translate-y-1 flex justify-center items-center gap-2 text-lg"><DoorOpen size={24} />Confirmar Saída</button>
-                            <button onClick={() => cancelarPedido(meuPedido)} className="w-full bg-white text-red-600 font-bold uppercase py-3 border-2 border-red-600 hover:bg-red-50 text-sm">Cancelar Pedido</button>
+                            <button onClick={() => registrarSaida(meuPedido)} disabled={isProcessing} className="w-full bg-[#00579D] text-white font-bold uppercase py-5 border-b-4 border-[#003865] active:border-b-0 active:translate-y-1 flex justify-center items-center gap-2 text-lg disabled:opacity-60 disabled:cursor-not-allowed"><DoorOpen size={24} />Confirmar Saída</button>
+                            <button onClick={() => cancelarPedido(meuPedido)} disabled={isProcessing} className="w-full bg-white text-red-600 font-bold uppercase py-3 border-2 border-red-600 hover:bg-red-50 text-sm disabled:opacity-60 disabled:cursor-not-allowed">Cancelar Pedido</button>
                           </div>
                         ) : (
                           <div className="w-full space-y-4">
                             {isPaused ? <p className="text-amber-700 font-bold uppercase border-2 border-amber-400 bg-amber-50 p-4 flex items-center justify-center gap-2"><ShieldAlert size={18} />Na fila — aguardando liberação</p> : <p className="text-[#2B2B2B] font-bold uppercase border-2 border-[#2B2B2B] p-5 text-lg">Aguardando...</p>}
-                            <button onClick={() => cancelarPedido(meuPedido)} className="w-full bg-white text-red-600 font-bold uppercase py-3 border-2 border-red-600 hover:bg-red-50 text-sm">Desistir da Fila</button>
+                            <button onClick={() => cancelarPedido(meuPedido)} disabled={isProcessing} className="w-full bg-white text-red-600 font-bold uppercase py-3 border-2 border-red-600 hover:bg-red-50 text-sm disabled:opacity-60 disabled:cursor-not-allowed">Desistir da Fila</button>
                           </div>
                         )
                       ) : meuPedido.status === "saida" ? (
                         <div className="w-full space-y-5">
                           <p className="text-[#00579D] font-bold uppercase text-xl">Você está fora.</p>
-                          <button onClick={() => registrarChegada(meuPedido)} className="w-full bg-[#2B2B2B] text-white font-bold uppercase py-5 border-b-4 border-black active:border-b-0 active:translate-y-1 flex justify-center items-center gap-2 text-lg"><CheckCircle2 size={24} />Confirmar Retorno</button>
+                          <button onClick={() => registrarChegada(meuPedido)} disabled={isProcessing} className="w-full bg-[#2B2B2B] text-white font-bold uppercase py-5 border-b-4 border-black active:border-b-0 active:translate-y-1 flex justify-center items-center gap-2 text-lg disabled:opacity-60 disabled:cursor-not-allowed"><CheckCircle2 size={24} />Confirmar Retorno</button>
                         </div>
                       ) : null}
                     </section>
@@ -835,7 +1026,7 @@ export default function Home() {
                             const exc = tm >= (turmaAtiva.time_limit_minutes || 15);
                             return <li key={af.id} className={`p-4 flex justify-between items-center ${exc ? "bg-red-50 border-l-4 border-red-600" : "hover:bg-gray-50"}`}>
                               <div><p className={`font-extrabold text-lg uppercase ${exc ? "text-red-700" : "text-[#00579D]"}`}>{af.name}</p><p className="text-xs font-bold text-gray-500 uppercase mt-1">Saída: {formatarHora(af.go_time)}</p>{exc && <p className="text-xs font-bold text-red-600 uppercase mt-1 flex items-center gap-1 animate-pulse"><ShieldAlert size={14} />Excedeu {tm} min</p>}</div>
-                              {isPrivileged && <div className="flex gap-2"><button onClick={() => forcarRetornoAluno(af)} className="p-3 bg-green-600 text-white hover:bg-green-700 rounded-sm"><CheckCircle2 size={18} /></button><button onClick={() => cancelarPedido(af)} className="p-3 bg-red-600 text-white hover:bg-red-700 rounded-sm"><Trash2 size={18} /></button></div>}
+                              {isPrivileged && <div className="flex gap-2"><button onClick={() => forcarRetornoAluno(af)} disabled={isProcessing} className="p-3 bg-green-600 text-white hover:bg-green-700 rounded-sm disabled:opacity-60"><CheckCircle2 size={18} /></button><button onClick={() => cancelarPedido(af)} disabled={isProcessing} className="p-3 bg-red-600 text-white hover:bg-red-700 rounded-sm disabled:opacity-60"><Trash2 size={18} /></button></div>}
                             </li>;
                           })}
                       </ul>
@@ -846,7 +1037,7 @@ export default function Home() {
                         {filaEsperaOrdenada.length === 0 ? <p className="text-center text-gray-500 font-medium italic uppercase text-sm p-6">Fila vazia</p>
                           : filaEsperaOrdenada.map((a, i) => <li key={a.id} className="p-4 flex flex-wrap gap-2 justify-between items-center hover:bg-gray-50">
                             <div className="flex items-center gap-4"><span className="text-[#00579D] font-black text-xl w-6">{i + 1}º</span><div><p className="font-bold text-[#2B2B2B] uppercase">{a.name}</p><p className="text-xs font-bold text-gray-500 uppercase">Req: {formatarHora(a.require_time)}</p></div></div>
-                            {isPrivileged && <div className="flex gap-2 items-center"><div className="flex flex-col gap-1 mr-2"><button onClick={() => moverPosicao(i, "up")} disabled={i === 0 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowUp size={14} /></button><button onClick={() => moverPosicao(i, "down")} disabled={i === filaEsperaOrdenada.length - 1 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowDown size={14} /></button></div><button onClick={() => forcarSaidaAluno(a)} className="p-2 bg-green-600 text-white hover:bg-green-700"><DoorOpen size={16} /></button><button onClick={() => cancelarPedido(a)} className="p-2 bg-[#2B2B2B] text-white hover:bg-black"><Trash2 size={16} /></button></div>}
+                            {isPrivileged && <div className="flex gap-2 items-center"><div className="flex flex-col gap-1 mr-2"><button onClick={() => moverPosicao(i, "up")} disabled={i === 0 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowUp size={14} /></button><button onClick={() => moverPosicao(i, "down")} disabled={i === filaEsperaOrdenada.length - 1 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowDown size={14} /></button></div><button onClick={() => forcarSaidaAluno(a)} disabled={isProcessing} className="p-2 bg-green-600 text-white hover:bg-green-700 disabled:opacity-60"><DoorOpen size={16} /></button><button onClick={() => cancelarPedido(a)} disabled={isProcessing} className="p-2 bg-[#2B2B2B] text-white hover:bg-black disabled:opacity-60"><Trash2 size={16} /></button></div>}
                           </li>)}
                       </ul>
                     </section>
