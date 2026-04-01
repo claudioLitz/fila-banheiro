@@ -6,15 +6,15 @@ import { useRouter } from "next/navigation";
 
 export default function Login() {
   const [isRegistering, setIsRegistering] = useState(false);
-  
+
   const [nome, setNome] = useState("");
   const [emailPrefix, setEmailPrefix] = useState("");
   const [senha, setSenha] = useState("");
-  
+
   const [erro, setErro] = useState("");
   const [sucesso, setSucesso] = useState("");
   const [carregando, setCarregando] = useState(false);
-  
+
   const router = useRouter();
   const DOMINIO_SENAI = "@estudante.sesisenai.org.br";
 
@@ -28,54 +28,46 @@ export default function Login() {
       const nomeDigitado = nome.trim();
 
       if (isRegistering) {
-        // ==========================
-        // FLUXO DE REGISTRO
-        // ==========================
+        // ── REGISTRO ─────────────────────────────────────────
         if (!emailPrefix.trim()) throw new Error("Preencha o prefixo do e-mail.");
-        
+
         const emailCompleto = emailPrefix.trim().toLowerCase() + DOMINIO_SENAI;
-        
+
         const { data, error: signUpError } = await supabase.auth.signUp({
           email: emailCompleto,
           password: senha,
-          options: {
-            data: { name: nomeDigitado } 
-          }
+          options: { data: { name: nomeDigitado } },
         });
 
         if (signUpError) {
           if (signUpError.message.includes("already registered") || signUpError.message.includes("already exists")) {
-            throw new Error("Este e-mail já está cadastrado! Clique na aba 'Entrar' acima.");
+            throw new Error("Este e-mail já está cadastrado! Clique em 'Entrar'.");
           }
-          throw signUpError; 
+          throw signUpError;
         }
-        
-        // NOVIDADE: Verifica se o Supabase já logou a pessoa automaticamente (Confirmação desligada)
+
         if (data.session) {
           router.push("/");
         } else {
-          // Se não logou, é porque a confirmação de e-mail está ligada
-          setSucesso("Conta criada com sucesso! Você já pode entrar.");
-          setNome("");
-          setEmailPrefix("");
-          setSenha("");
-          setIsRegistering(false); // Muda a aba para "Entrar"
+          setSucesso("Conta criada! Você já pode entrar.");
+          setNome(""); setEmailPrefix(""); setSenha("");
+          setIsRegistering(false);
         }
 
       } else {
-        // ==========================
-        // FLUXO DE LOGIN (Entrar)
-        // ==========================
+        // ── LOGIN ─────────────────────────────────────────────
+        // Busca o email pelo nome — query direcionada, não carrega todos os usuários
         const { data: usuarios, error: erroBusca } = await supabase
           .from("users")
-          .select("name, email");
+          .select("name, email")
+          .ilike("name", nomeDigitado) // case-insensitive direto no banco
+          .limit(5); // no máximo 5 resultados para comparação
 
-        if (erroBusca || !usuarios) {
-          throw new Error("Erro ao acessar o banco de dados.");
-        }
+        if (erroBusca) throw new Error("Erro ao acessar o banco de dados.");
 
-        const usuarioDados = usuarios.find(
-          (u) => u.name.trim().localeCompare(nomeDigitado, 'pt-BR', { sensitivity: 'base' }) === 0
+        // Comparação acentuação-insensitive no cliente (ilike não cobre acentos)
+        const usuarioDados = (usuarios || []).find(
+          (u) => u.name.trim().localeCompare(nomeDigitado, "pt-BR", { sensitivity: "base" }) === 0
         );
 
         if (!usuarioDados) {
@@ -89,22 +81,18 @@ export default function Login() {
 
         if (erroAuth) {
           if (erroAuth.message.includes("Email not confirmed")) {
-            throw new Error("Você ainda não confirmou seu e-mail. Olhe sua caixa de entrada!");
+            throw new Error("Confirme seu e-mail antes de entrar.");
           }
           if (erroAuth.message.includes("Invalid login credentials")) {
             throw new Error("Senha incorreta.");
           }
           throw erroAuth;
         }
-        
+
         router.push("/");
       }
     } catch (error) {
-      if (error instanceof Error) {
-        setErro(error.message);
-      } else {
-        setErro("Ocorreu um erro inesperado.");
-      }
+      setErro(error instanceof Error ? error.message : "Ocorreu um erro inesperado.");
     } finally {
       setCarregando(false);
     }
@@ -116,30 +104,30 @@ export default function Login() {
       <header className="bg-[#00579D] text-white px-8 py-4 shadow-md flex justify-between items-center">
         <div className="flex items-center gap-4">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo-senai.png" alt="Logo SENAI" className="h-8 sm:h-10 object-contain" onError={(e) => e.currentTarget.style.display = 'none'} />
+          <img src="/logo-senai.png" alt="Logo SENAI" className="h-8 sm:h-10 object-contain" onError={(e) => e.currentTarget.style.display = "none"} />
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/logo-weg.png" alt="Logo WEG" className="h-8 sm:h-10 object-contain" onError={(e) => e.currentTarget.style.display = 'none'} />
+          <img src="/logo-weg.png" alt="Logo WEG" className="h-8 sm:h-10 object-contain" onError={(e) => e.currentTarget.style.display = "none"} />
           <h1 className="text-xl font-bold tracking-wider uppercase hidden sm:block ml-4 border-l-2 border-white/30 pl-4">
             Controle de Acesso
           </h1>
         </div>
       </header>
 
-      {/* CONTEÚDO CENTRAL */}
+      {/* FORMULÁRIO */}
       <div className="flex flex-1 items-center justify-center px-6 py-12">
         <div className="bg-white border-t-8 border-[#00579D] shadow-xl p-8 w-full max-w-md">
-          
+
           <div className="flex mb-8 border-b-2 border-gray-200">
-            <button 
+            <button
               type="button"
-              className={`flex-1 pb-3 font-bold uppercase tracking-widest transition-colors ${!isRegistering ? 'text-[#00579D] border-b-4 border-[#00579D]' : 'text-gray-400 hover:text-gray-600'}`}
+              className={`flex-1 pb-3 font-bold uppercase tracking-widest transition-colors ${!isRegistering ? "text-[#00579D] border-b-4 border-[#00579D]" : "text-gray-400 hover:text-gray-600"}`}
               onClick={() => { setIsRegistering(false); setErro(""); setSucesso(""); }}
             >
               Entrar
             </button>
-            <button 
+            <button
               type="button"
-              className={`flex-1 pb-3 font-bold uppercase tracking-widest transition-colors ${isRegistering ? 'text-[#00579D] border-b-4 border-[#00579D]' : 'text-gray-400 hover:text-gray-600'}`}
+              className={`flex-1 pb-3 font-bold uppercase tracking-widest transition-colors ${isRegistering ? "text-[#00579D] border-b-4 border-[#00579D]" : "text-gray-400 hover:text-gray-600"}`}
               onClick={() => { setIsRegistering(true); setErro(""); setSucesso(""); }}
             >
               Cadastrar
@@ -187,7 +175,7 @@ export default function Login() {
                     placeholder="joao.silva"
                     className="w-full px-4 py-3 bg-transparent text-[#2B2B2B] font-bold focus:outline-none"
                     value={emailPrefix}
-                    onChange={(e) => setEmailPrefix(e.target.value.replace(/\s+/g, ''))}
+                    onChange={(e) => setEmailPrefix(e.target.value.replace(/\s+/g, ""))}
                     required={isRegistering}
                   />
                   <div className="bg-[#2B2B2B] text-white px-3 flex items-center justify-center text-xs font-bold tracking-widest border-l-2 border-[#2B2B2B]">
@@ -220,11 +208,12 @@ export default function Login() {
             <button
               type="submit"
               disabled={carregando}
-              className="w-full py-4 mt-4 text-white font-bold tracking-widest uppercase transition-all disabled:opacity-50 bg-[#00579D] hover:bg-[#003865] border-b-4 border-[#003865] active:border-b-0 active:translate-y-1 flex items-center justify-center gap-2"
+              className="w-full py-4 mt-4 text-white font-bold tracking-widest uppercase transition-all disabled:opacity-50 bg-[#00579D] hover:bg-[#003865] border-b-4 border-[#003865] active:border-b-0 active:translate-y-1"
             >
-              {carregando ? "Processando..." : (isRegistering ? "Criar Conta" : "Entrar no Sistema")}
+              {carregando ? "Processando..." : isRegistering ? "Criar Conta" : "Entrar no Sistema"}
             </button>
           </form>
+
         </div>
       </div>
 

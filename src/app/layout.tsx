@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Fila do Banheiro | SENAI",
-  description: "Gerenciador de fila do banheiro para salas de aula",
+  title: "SGT | CentroWEG",
+  description: "Sistema Gerenciador de Turmas do CentroWEG",
 };
 
 export default function RootLayout({
