@@ -7,7 +7,7 @@ import {
   UserPlus, CheckCircle2, LogOut,
   DoorOpen, PauseCircle, PlayCircle, Trash2, ShieldAlert,
   ClipboardList, XCircle, BookOpen, Users, Plus, Settings, LayoutGrid, BarChart3, Shield,
-  ArrowUp, ArrowDown, ChevronDown, ChevronUp, Search, Timer
+  ArrowUp, ArrowDown, ChevronDown, ChevronUp, Search, Timer, ArrowLeft
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
@@ -39,6 +39,7 @@ export default function Home() {
 
   type ViewMode = "dashboard" | "settings" | "queue" | "no_class" | "admin_panel";
   const [viewMode, setViewMode] = useState<ViewMode>("dashboard");
+  const [viewAnterior, setViewAnterior] = useState<ViewMode | null>(null);
   const [turmas, setTurmas] = useState<Classroom[]>([]);
   const [novaTurmaNome, setNovaTurmaNome] = useState("");
   const [turmaAtiva, setTurmaAtiva] = useState<Classroom | null>(null);
@@ -59,6 +60,7 @@ export default function Home() {
   const [is5sOpen, setIs5sOpen] = useState(false);
   const [alunosPulados, setAlunosPulados] = useState<string[]>([]);
   const [mostrarHistorico5S, setMostrarHistorico5S] = useState(false);
+  const [logs5SHistorico, setLogs5SHistorico] = useState<LogPedido[]>([]);
   const [isHistoricoOpen, setIsHistoricoOpen] = useState(false);
   const [abaHistorico, setAbaHistorico] = useState<"lista" | "relatorio">("lista");
   const [diaSelecionado, setDiaSelecionado] = useState<string | null>(null);
@@ -353,6 +355,14 @@ export default function Home() {
           .then(({ data }) => setAlunosNaTurmaAtual(data || []));
       }
 
+      // Carrega histórico 5S da turma (visível para todos) — sem limite de data
+      supabase.from("logs")
+        .select("id, user_id, name, status, require_time, description")
+        .eq("status", "5s_history")
+        .ilike("description", `%[TURMA:${turma.name}]%`)
+        .order("require_time", { ascending: false })
+        .then(({ data }) => setLogs5SHistorico((data || []) as LogPedido[]));
+
       // Mostra a fila imediatamente — lista de alunos carrega em background
       setTurmaAtiva(turma);
       setViewMode("queue");
@@ -381,6 +391,7 @@ export default function Home() {
         const profsIds = vinculosProfs.map((v: any) => v.user_id);
         setProfessoresNaTurmaAtual(listaTodosProfs.filter((p: UserDB) => profsIds.includes(p.user_id)));
       }
+      setViewAnterior(viewMode);
       setViewMode("settings");
     } finally { setIsProcessing(false); }
   };
@@ -393,6 +404,14 @@ export default function Home() {
         const { data: alunosData } = await supabase.from("users").select("user_id, name, acess_level, fives_count").in("user_id", vinculos.map(v => v.user_id));
         setAlunosNaTurmaAtual(alunosData || []);
       } else setAlunosNaTurmaAtual([]);
+      // Carrega histórico 5S para todos — sem limite de data
+      const { data: hist5s } = await supabase.from("logs")
+        .select("id, user_id, name, status, require_time, description")
+        .eq("status", "5s_history")
+        .ilike("description", `%[TURMA:${turma.name}]%`)
+        .order("require_time", { ascending: false });
+      setLogs5SHistorico((hist5s || []) as LogPedido[]);
+      setViewAnterior(viewMode);
       setViewMode("queue");
     } finally { setIsProcessing(false); }
   };
@@ -445,11 +464,11 @@ export default function Home() {
     try {
       const [{ data: usuariosData }, { data: auditoriaData }] = await Promise.all([
         supabase.from("users").select("user_id, name, acess_level, email").order("name"),
-        supabase.from("logs").select("id, user_id, name, status, require_time, description").eq("status", "auditoria").order("require_time", { ascending: false }).limit(200),
+        supabase.from("logs").select("id, user_id, name, status, require_time, description").order("require_time", { ascending: false }).limit(500),
       ]);
       if (usuariosData) setTodosUsuarios(usuariosData);
       if (auditoriaData) setLogsAuditoria(auditoriaData as LogPedido[]);
-      setUsuariosSelecionados([]); setViewMode("admin_panel");
+      setUsuariosSelecionados([]); setViewAnterior(viewMode); setViewMode("admin_panel");
     } finally { setIsProcessing(false); }
   };
 
@@ -752,6 +771,22 @@ export default function Home() {
 
   const fazerLogout = async () => { await supabase.auth.signOut(); router.push("/login"); };
 
+  // Aluno troca de posição com quem está logo atrás na fila
+  const darMinhaVez = async () => {
+    if (processingRef.current || !currentUser || !meuPedido) return;
+    const meuIndex = filaEsperaOrdenada.findIndex(p => p.user_id === currentUser.user_id);
+    if (meuIndex === -1 || meuIndex === filaEsperaOrdenada.length - 1) return; // já é o último
+    processingRef.current = true; setIsProcessing(true);
+    try {
+      const eu = filaEsperaOrdenada[meuIndex];
+      const proximo = filaEsperaOrdenada[meuIndex + 1];
+      await Promise.all([
+        supabase.from("logs").update({ description: ((eu.description || "").replace(/\[OVERRIDE:.*?\]/g, "") + ` [OVERRIDE:${getEffectiveTime(proximo)}]`).trim() }).eq("id", eu.id),
+        supabase.from("logs").update({ description: ((proximo.description || "").replace(/\[OVERRIDE:.*?\]/g, "") + ` [OVERRIDE:${getEffectiveTime(eu)}]`).trim() }).eq("id", proximo.id),
+      ]);
+    } finally { processingRef.current = false; setIsProcessing(false); }
+  };
+
   // 5S
   const alterarQtd5S = async (novaQtd: number) => {
     if (!turmaAtiva) return;
@@ -785,7 +820,8 @@ export default function Home() {
     } catch { alert("Erro ao confirmar 5S."); } finally { setIsProcessing(false); }
   };
 
-  const historico5SDaTurma = useMemo(() => historicoCompleto.filter(l => l.status === "5s_history" && l.description?.includes(`[TURMA:${turmaAtiva?.name}]`)), [historicoCompleto, turmaAtiva?.name]);
+  // Tanto professor/admin quanto aluno usam logs5SHistorico — query dedicada sem limite de data
+  const historico5SDaTurma = useMemo(() => logs5SHistorico, [logs5SHistorico]);
 
   // Relatórios (memoizados)
   // resumoHojeAluno: filtra logsConcluidosHoje apenas por membros da turma atual
@@ -812,7 +848,7 @@ export default function Home() {
       if (!mapa[log.user_id]) mapa[log.user_id] = { nome: log.name, idas: 0, tempoTotal: 0 };
       mapa[log.user_id].idas += 1; mapa[log.user_id].tempoTotal += t;
     });
-    return Object.values(mapa).map(i => ({ ...i, mediaTempo: i.idas > 0 ? Math.round(i.tempoTotal / i.idas) : 0 })).sort((a, b) => b.idas - a.idas);
+    return Object.values(mapa).map(i => ({ ...i, mediaTempo: i.idas > 0 ? Math.round(i.tempoTotal / i.idas) : 0 })).sort((a, b) => b.idas - a.idas || b.tempoTotal - a.tempoTotal);
   }, [historicoDaTurma, alunosNaTurmaAtual]);
 
   const gerarRelatorioTurma = useMemo(() => {
@@ -843,6 +879,13 @@ export default function Home() {
   }, [currentUser, turmaAtiva, isPrivileged]);
 
   // Helpers
+  const voltarView = () => {
+    const destino = viewAnterior ?? "dashboard";
+    setViewAnterior(null);
+    if (destino === "dashboard") { carregarDashboard(); }
+    setViewMode(destino);
+  };
+
   const formatarHora = (d: string | null) => d ? new Date(d).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "-";
   const getEventTime = (l: LogPedido) => l.status.includes("saida") ? l.go_time : l.status === "concluido" ? l.back_time : l.require_time;
   const getStatusDisplay = (s: string) => {
@@ -865,7 +908,11 @@ export default function Home() {
   };
 
   const usuariosVisiveis = useMemo(() => todosUsuarios.filter(u => u.name.toLowerCase().includes(buscaUsuarios.toLowerCase()) || (u.email && u.email.toLowerCase().includes(buscaUsuarios.toLowerCase()))), [todosUsuarios, buscaUsuarios]);
-  const auditoriaVisivel = useMemo(() => logsAuditoria.filter(l => l.name.toLowerCase().includes(filtroAuditoria.toLowerCase())), [logsAuditoria, filtroAuditoria]);
+  const auditoriaVisivel = useMemo(() => logsAuditoria.filter(l => {
+    const q = filtroAuditoria.toLowerCase();
+    if (!q) return true;
+    return l.name.toLowerCase().includes(q) || (l.description ?? "").toLowerCase().includes(q);
+  }), [logsAuditoria, filtroAuditoria]);
   const turmasVisiveisList = useMemo(() => turmas.filter(t => t.name.toLowerCase().includes(buscaTurmas.toLowerCase())), [turmas, buscaTurmas]);
   const historicoVisivel = useMemo(() => historicoDaTurma.filter(l => l.name.toLowerCase().includes(filtroHistorico.toLowerCase())), [historicoDaTurma, filtroHistorico]);
 
@@ -907,6 +954,7 @@ export default function Home() {
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 space-y-10">
             <div className="flex justify-between items-center border-b-4 border-purple-600 pb-4 mb-8">
               <h2 className="text-2xl font-extrabold uppercase tracking-widest flex items-center gap-2 text-purple-700"><Shield size={28} /> Painel de Administração Geral</h2>
+              <button onClick={voltarView} className="flex items-center gap-2 bg-gray-200 text-[#2B2B2B] px-4 py-2 font-bold uppercase tracking-wider hover:bg-gray-300 border-b-4 border-gray-400 active:border-b-0 active:translate-y-1 text-sm"><ArrowLeft size={16} />Voltar</button>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
               <section className="bg-white shadow-md border-t-8 border-purple-600 lg:col-span-1 h-fit">
@@ -939,14 +987,14 @@ export default function Home() {
                 </ul>
               </section>
               <section className="bg-white shadow-md border-t-8 border-[#2B2B2B] lg:col-span-1 h-fit">
-                <div className="bg-[#2B2B2B] text-white px-6 py-4 font-bold uppercase tracking-widest flex justify-between items-center"><span>Auditoria</span><span className="text-xs bg-white text-[#2B2B2B] px-2 py-1 rounded font-black">{auditoriaVisivel.length}</span></div>
-                <div className="p-4 border-b-2 border-gray-200 bg-gray-50"><div className="relative"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} /><input type="text" placeholder="Filtrar por professor..." className="w-full pl-9 pr-3 py-2 border-2 border-gray-300 focus:border-[#2B2B2B] outline-none text-sm font-bold uppercase" value={filtroAuditoria} onChange={e => setFiltroAuditoria(e.target.value)} /></div></div>
+                <div className="bg-[#2B2B2B] text-white px-6 py-4 font-bold uppercase tracking-widest flex justify-between items-center"><span>Logs do Sistema</span><span className="text-xs bg-white text-[#2B2B2B] px-2 py-1 rounded font-black">{auditoriaVisivel.length}</span></div>
+                <div className="p-4 border-b-2 border-gray-200 bg-gray-50"><div className="relative"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={16} /><input type="text" placeholder="Buscar por nome ou descrição..." className="w-full pl-9 pr-3 py-2 border-2 border-gray-300 focus:border-[#2B2B2B] outline-none text-sm font-bold uppercase" value={filtroAuditoria} onChange={e => setFiltroAuditoria(e.target.value)} /></div></div>
                 <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
                   <table className="w-full text-left border-collapse">
-                    <thead className="sticky top-0 bg-[#F4F4F4] shadow-sm"><tr className="border-b-2 border-[#2B2B2B] text-[#2B2B2B] uppercase text-xs"><th className="p-4 font-bold">Hora</th><th className="p-4 font-bold">Professor / Ação</th></tr></thead>
+                    <thead className="sticky top-0 bg-[#F4F4F4] shadow-sm"><tr className="border-b-2 border-[#2B2B2B] text-[#2B2B2B] uppercase text-xs"><th className="p-4 font-bold">Hora</th><th className="p-4 font-bold">Usuário / Descrição</th></tr></thead>
                     <tbody className="divide-y divide-gray-200">
                       {auditoriaVisivel.length === 0 ? <tr><td colSpan={2} className="p-6 text-center text-gray-400 font-bold uppercase">Nenhum registro.</td></tr>
-                        : auditoriaVisivel.map(log => <tr key={log.id} className="hover:bg-gray-50"><td className="p-4 font-mono text-xs font-bold text-gray-600 whitespace-nowrap align-top">{formatarHora(log.require_time)}</td><td className="p-4"><p className="font-extrabold text-[#2B2B2B] uppercase text-xs">{log.name}</p><p className="text-[10px] font-bold text-purple-700 uppercase mt-1">{log.description}</p></td></tr>)}
+                        : auditoriaVisivel.map(log => <tr key={log.id} className="hover:bg-gray-50"><td className="p-4 font-mono text-xs font-bold text-gray-600 whitespace-nowrap align-top">{formatarHora(log.require_time)}</td><td className="p-4"><p className="font-extrabold text-[#2B2B2B] uppercase text-xs">{log.name}</p><p className="text-[10px] font-bold text-gray-400 uppercase mt-0.5">{log.status}</p><p className="text-[10px] font-bold text-purple-700 uppercase mt-1">{log.description}</p></td></tr>)}
                     </tbody>
                   </table>
                 </div>
@@ -989,7 +1037,10 @@ export default function Home() {
             <div className="bg-white border-2 border-[#2B2B2B] shadow-md">
               <div className="bg-[#2B2B2B] text-white px-6 py-4 flex justify-between items-center">
                 <h2 className="text-xl font-extrabold uppercase tracking-widest flex items-center gap-2"><Settings size={24} /> Configurações: {turmaAtiva.name}</h2>
-                {isAdmin && <button onClick={() => excluirTurma(turmaAtiva.id)} className="text-red-400 hover:text-red-500"><Trash2 size={20} /></button>}
+                <div className="flex items-center gap-3">
+                  <button onClick={voltarView} className="flex items-center gap-2 bg-gray-600 text-white px-3 py-2 font-bold uppercase text-xs tracking-wider hover:bg-gray-700 border-b-2 border-gray-800 active:border-b-0 active:translate-y-1"><ArrowLeft size={14} />Voltar</button>
+                  {isAdmin && <button onClick={() => excluirTurma(turmaAtiva.id)} className="text-red-400 hover:text-red-500"><Trash2 size={20} /></button>}
+                </div>
               </div>
               <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-8">
                 <div className="col-span-1 md:col-span-2 grid grid-cols-1 sm:grid-cols-2 gap-6">
@@ -1070,16 +1121,19 @@ export default function Home() {
                             ))}
                         </ul>
                       ) : (
-                        // Alunos: veem apenas nome + idas (sem tempos — privacidade)
-                        <ul className="space-y-3">
-                          {resumoHojeAluno.length === 0
-                            ? <p className="text-sm text-gray-500 font-bold text-center mt-4">Nenhum aluno foi ao banheiro hoje.</p>
-                            : resumoHojeAluno.map((e, idx) => (
-                              <li key={idx} className="flex justify-between items-center p-3 bg-[#F4F4F4] border-l-4 border-[#00579D]">
-                                <div><p className="font-black text-[#2B2B2B] uppercase text-sm">{idx + 1}º {e.nome}</p><p className="text-xs font-bold text-[#00579D]">{e.idas} {e.idas === 1 ? "ida" : "idas"}</p></div>
-                              </li>
-                            ))}
-                        </ul>
+                        // Alunos: veem APENAS os próprios dados — sem ver outros alunos
+                        (() => {
+                          const meuResumo = resumoHojeAluno.find(e => e.nome === currentUser.name);
+                          return meuResumo ? (
+                            <div className="flex flex-col items-center justify-center gap-3 mt-4 p-4 bg-[#F4F4F4] border-l-4 border-[#00579D]">
+                              <p className="font-black text-[#2B2B2B] uppercase text-sm text-center">{meuResumo.nome}</p>
+                              <p className="text-2xl font-black text-[#00579D]">{meuResumo.idas}</p>
+                              <p className="text-xs font-bold text-gray-500 uppercase">{meuResumo.idas === 1 ? "ida hoje" : "idas hoje"}</p>
+                            </div>
+                          ) : (
+                            <p className="text-sm text-gray-500 font-bold text-center mt-4">Você ainda não foi ao banheiro hoje.</p>
+                          );
+                        })()
                       )}
                     </div>
                   )}
@@ -1089,7 +1143,10 @@ export default function Home() {
               {/* Painel Principal */}
               <div className="flex-1 w-full space-y-6 min-w-0">
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b-4 border-[#00579D] pb-4">
-                  <h2 className="text-2xl font-extrabold uppercase tracking-widest flex items-center gap-2"><ClipboardList size={28} />Fila: {turmaAtiva.name}</h2>
+                  <div className="flex items-center gap-3">
+                    {isPrivileged && <button onClick={voltarView} className="flex items-center gap-2 bg-gray-200 text-[#2B2B2B] px-3 py-2 font-bold uppercase text-xs tracking-wider hover:bg-gray-300 border-b-2 border-gray-400 active:border-b-0 active:translate-y-1"><ArrowLeft size={14} />Voltar</button>}
+                    <h2 className="text-2xl font-extrabold uppercase tracking-widest flex items-center gap-2"><ClipboardList size={28} />Fila: {turmaAtiva.name}</h2>
+                  </div>
                   {isPrivileged && <button onClick={alternarPausa} disabled={isProcessing} className={`font-bold uppercase tracking-widest py-3 px-6 border-b-4 active:border-b-0 active:translate-y-1 flex items-center gap-2 text-white ${isPaused ? "bg-[#00579D] border-[#003865]" : "bg-[#2B2B2B] border-black hover:bg-black"}`}>{isPaused ? <PlayCircle size={20} /> : <PauseCircle size={20} />}{isPaused ? "Liberar Turma" : "Bloquear Turma"}</button>}
                 </div>
 
@@ -1132,6 +1189,15 @@ export default function Home() {
                         ) : (
                           <div className="w-full space-y-4">
                             {isPaused ? <p className="text-amber-700 font-bold uppercase border-2 border-amber-400 bg-amber-50 p-4 flex items-center justify-center gap-2"><ShieldAlert size={18} />Na fila — aguardando liberação</p> : <p className="text-[#2B2B2B] font-bold uppercase border-2 border-[#2B2B2B] p-5 text-lg">Aguardando...</p>}
+                            {(() => {
+                              const meuIdx = filaEsperaOrdenada.findIndex(p => p.user_id === currentUser.user_id);
+                              const naoEUltimo = meuIdx !== -1 && meuIdx < filaEsperaOrdenada.length - 1;
+                              return naoEUltimo ? (
+                                <button onClick={darMinhaVez} disabled={isProcessing} className="w-full bg-amber-50 text-amber-700 font-bold uppercase py-3 border-2 border-amber-400 hover:bg-amber-100 text-sm disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2">
+                                  <ArrowDown size={16} />Dar minha vez
+                                </button>
+                              ) : null;
+                            })()}
                             <button onClick={() => cancelarPedido(meuPedido)} disabled={isProcessing} className="w-full bg-white text-red-600 font-bold uppercase py-3 border-2 border-red-600 hover:bg-red-50 text-sm disabled:opacity-60 disabled:cursor-not-allowed">Desistir da Fila</button>
                           </div>
                         )
@@ -1165,7 +1231,7 @@ export default function Home() {
                       <ul className="divide-y divide-gray-200 max-h-60 overflow-y-auto">
                         {filaEsperaOrdenada.length === 0 ? <p className="text-center text-gray-500 font-medium italic uppercase text-sm p-6">Fila vazia</p>
                           : filaEsperaOrdenada.map((a, i) => <li key={a.id} className="p-4 flex flex-wrap gap-2 justify-between items-center hover:bg-gray-50">
-                            <div className="flex items-center gap-4"><span className="text-[#00579D] font-black text-xl w-6">{i + 1}º</span><div><p className="font-bold text-[#2B2B2B] uppercase">{a.name}</p><p className="text-xs font-bold text-gray-500 uppercase">Req: {formatarHora(a.require_time)}</p></div></div>
+                            <div className="flex items-center gap-4"><span className="text-[#00579D] font-black text-xl w-6">{i + 1}º</span><div><p className="font-bold text-[#2B2B2B] uppercase">{a.name}</p>{isPrivileged && <p className="text-xs font-bold text-gray-500 uppercase">Req: {formatarHora(a.require_time)}</p>}</div></div>
                             {isPrivileged && <div className="flex gap-2 items-center"><div className="flex flex-col gap-1 mr-2"><button onClick={() => moverPosicao(i, "up")} disabled={i === 0 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowUp size={14} /></button><button onClick={() => moverPosicao(i, "down")} disabled={i === filaEsperaOrdenada.length - 1 || isProcessing} className="p-1 bg-gray-200 hover:bg-gray-300 rounded disabled:opacity-30"><ArrowDown size={14} /></button></div><button onClick={() => forcarSaidaAluno(a)} disabled={isProcessing} className="p-2 bg-green-600 text-white hover:bg-green-700 disabled:opacity-60"><DoorOpen size={16} /></button><button onClick={() => cancelarPedido(a)} disabled={isProcessing} className="p-2 bg-[#2B2B2B] text-white hover:bg-black disabled:opacity-60"><Trash2 size={16} /></button></div>}
                           </li>)}
                       </ul>
@@ -1297,7 +1363,7 @@ export default function Home() {
                         <ul className="space-y-3">
                           {historico5SDaTurma.length === 0
                             ? <p className="text-xs text-gray-500 font-bold text-center">Nenhum histórico registrado.</p>
-                            : historico5SDaTurma.slice(0, 15).map(log => (
+                            : historico5SDaTurma.map(log => (
                               <li key={log.id} className="text-xs font-bold border-b border-gray-100 pb-2">
                                 <span className="text-[#00579D]">{new Date(log.require_time).toLocaleDateString("pt-BR")}</span>{" - "}
                                 <span className="text-[#2B2B2B]">{log.name}</span>
@@ -1308,7 +1374,7 @@ export default function Home() {
                     )}
                   </div>
 
-                  {/* Botão — sempre fixo na base, fora da área de scroll */}
+                  {/* Botão confirmar — apenas para privilegiados */}
                   {isPrivileged && !mostrarHistorico5S && alunosPara5S.length > 0 && (
                     <div style={{ flexShrink: 0, padding: "12px", borderTop: "2px solid #e5e7eb", background: "white" }}>
                       <button onClick={confirmar5S} disabled={isProcessing} className="w-full bg-green-600 text-white font-bold uppercase py-3 hover:bg-green-700 text-xs tracking-widest flex items-center justify-center gap-2 border-b-4 border-green-800 active:border-b-0 active:translate-y-1">
