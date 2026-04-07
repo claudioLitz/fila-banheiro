@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { supabase } from "@/lib/supabase";
 import { useRouter } from "next/navigation";
+import { createBrowserClient } from "@supabase/ssr";
 
 export default function Login() {
   const [isRegistering, setIsRegistering] = useState(false);
@@ -17,6 +17,12 @@ export default function Login() {
 
   const router = useRouter();
   const DOMINIO_SENAI = "@estudante.sesisenai.org.br";
+
+  // Criação do cliente SSR do Supabase no navegador
+  const supabase = createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -48,6 +54,7 @@ export default function Login() {
 
         if (data.session) {
           router.push("/");
+          router.refresh(); // Atualiza o cache do Next.js
         } else {
           setSucesso("Conta criada! Você já pode entrar.");
           setNome(""); setEmailPrefix(""); setSenha("");
@@ -56,40 +63,27 @@ export default function Login() {
 
       } else {
         // ── LOGIN ─────────────────────────────────────────────
-        // Busca o email pelo nome — query direcionada, não carrega todos os usuários
-        const { data: usuarios, error: erroBusca } = await supabase
-          .from("users")
-          .select("name, email")
-          .ilike("name", nomeDigitado) // case-insensitive direto no banco
-          .limit(5); // no máximo 5 resultados para comparação
+        // 1. Validamos se o prefixo do email foi preenchido
+        if (!emailPrefix.trim()) throw new Error("Preencha o prefixo do seu e-mail.");
+        
+        // 2. Montamos o email completo
+        const emailCompleto = emailPrefix.trim().toLowerCase() + DOMINIO_SENAI;
 
-        if (erroBusca) throw new Error("Erro ao acessar o banco de dados.");
-
-        // Comparação acentuação-insensitive no cliente (ilike não cobre acentos)
-        const usuarioDados = (usuarios || []).find(
-          (u) => u.name.trim().localeCompare(nomeDigitado, "pt-BR", { sensitivity: "base" }) === 0
-        );
-
-        if (!usuarioDados) {
-          throw new Error("Usuário não encontrado. Verifique a ortografia do seu nome.");
-        }
-
-        const { error: erroAuth } = await supabase.auth.signInWithPassword({
-          email: usuarioDados.email,
+        // 3. Fazemos o login DIRETO pelo Supabase Auth (Isso ignora o bloqueio do RLS)
+        const { data, error: erroLogin } = await supabase.auth.signInWithPassword({
+          email: emailCompleto,
           password: senha,
         });
 
-        if (erroAuth) {
-          if (erroAuth.message.includes("Email not confirmed")) {
-            throw new Error("Confirme seu e-mail antes de entrar.");
-          }
-          if (erroAuth.message.includes("Invalid login credentials")) {
-            throw new Error("Senha incorreta.");
-          }
-          throw erroAuth;
+        if (erroLogin) {
+          throw new Error("Credenciais inválidas! Verifique seu usuário e senha.");
         }
 
-        router.push("/");
+        // 4. Se deu tudo certo, redireciona o usuário
+        if (data.session) {
+          router.push("/");
+          router.refresh();
+        }
       }
     } catch (error) {
       setErro(error instanceof Error ? error.message : "Ocorreu um erro inesperado.");
@@ -150,41 +144,44 @@ export default function Login() {
           )}
 
           <form onSubmit={handleSubmit} className="space-y-5">
-            <div>
-              <label className="block text-[#2B2B2B] text-xs font-bold mb-2 uppercase tracking-wider">
-                {isRegistering ? "Nome Completo" : "Nome de Usuário"}
-              </label>
-              <input
-                type="text"
-                placeholder={isRegistering ? "Ex: João Silva" : "Seu nome"}
-                className="w-full px-4 py-3 bg-[#F4F4F4] border-2 border-[#2B2B2B] text-[#2B2B2B] font-bold focus:outline-none focus:border-[#00579D] focus:bg-white transition-all"
-                value={nome}
-                onChange={(e) => setNome(e.target.value)}
-                required
-              />
-            </div>
-
+            {/* O campo NOME só aparece se for CADASTRO */}
             {isRegistering && (
               <div>
                 <label className="block text-[#2B2B2B] text-xs font-bold mb-2 uppercase tracking-wider">
-                  E-mail Institucional
+                  Nome Completo
                 </label>
-                <div className="flex items-stretch border-2 border-[#2B2B2B] bg-[#F4F4F4] focus-within:border-[#00579D] focus-within:bg-white transition-all">
-                  <input
-                    type="text"
-                    placeholder="joao.silva"
-                    className="w-full px-4 py-3 bg-transparent text-[#2B2B2B] font-bold focus:outline-none"
-                    value={emailPrefix}
-                    onChange={(e) => setEmailPrefix(e.target.value.replace(/\s+/g, ""))}
-                    required={isRegistering}
-                  />
-                  <div className="bg-[#2B2B2B] text-white px-3 flex items-center justify-center text-xs font-bold tracking-widest border-l-2 border-[#2B2B2B]">
-                    {DOMINIO_SENAI}
-                  </div>
-                </div>
+                <input
+                  type="text"
+                  placeholder="Ex: João Silva"
+                  className="w-full px-4 py-3 bg-[#F4F4F4] border-2 border-[#2B2B2B] text-[#2B2B2B] font-bold focus:outline-none focus:border-[#00579D] focus:bg-white transition-all"
+                  value={nome}
+                  onChange={(e) => setNome(e.target.value)}
+                  required={isRegistering}
+                />
               </div>
             )}
 
+            {/* O campo E-MAIL (Prefixo) aparece TANTO NO LOGIN QUANTO NO CADASTRO */}
+            <div>
+              <label className="block text-[#2B2B2B] text-xs font-bold mb-2 uppercase tracking-wider">
+                {isRegistering ? "E-mail Institucional" : "Nome de Usuário (E-mail)"}
+              </label>
+              <div className="flex items-stretch border-2 border-[#2B2B2B] bg-[#F4F4F4] focus-within:border-[#00579D] focus-within:bg-white transition-all">
+                <input
+                  type="text"
+                  placeholder="joao.silva"
+                  className="w-full px-4 py-3 bg-transparent text-[#2B2B2B] font-bold focus:outline-none"
+                  value={emailPrefix}
+                  onChange={(e) => setEmailPrefix(e.target.value.replace(/\s+/g, ""))}
+                  required
+                />
+                <div className="bg-[#2B2B2B] text-white px-3 flex items-center justify-center text-xs font-bold tracking-widest border-l-2 border-[#2B2B2B]">
+                  {DOMINIO_SENAI}
+                </div>
+              </div>
+            </div>
+
+            {/* SENHA (Aparece em ambos) */}
             <div>
               <label className="block text-[#2B2B2B] text-xs font-bold mb-2 uppercase tracking-wider">
                 Senha
@@ -199,12 +196,14 @@ export default function Login() {
               />
             </div>
 
+            {/* MENSAGEM DE ERRO */}
             {erro && (
               <div className="bg-white border-2 border-red-600 p-3">
                 <p className="text-red-600 text-sm font-bold text-center uppercase tracking-wider">{erro}</p>
               </div>
             )}
 
+            {/* BOTÃO DE ENVIAR */}
             <button
               type="submit"
               disabled={carregando}

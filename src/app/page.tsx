@@ -1,8 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { supabase } from "@/lib/supabase";
-import { createClient } from "@supabase/supabase-js";
+import { createBrowserClient } from "@supabase/ssr";
 import {
   UserPlus, CheckCircle2, LogOut,
   DoorOpen, PauseCircle, PlayCircle, Trash2, ShieldAlert,
@@ -21,6 +20,11 @@ type Classroom = { id: string; name: string; time_limit_minutes: number; cooldow
 type ClassroomTeacherDB = { user_id: string; classroom_id: string; };
 
 export default function Home() {
+  const supabase = createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  );
+
   const [todosLogsAtivos, setTodosLogsAtivos] = useState<LogPedido[]>([]);
   const [historicoCompleto, setHistoricoCompleto] = useState<LogPedido[]>([]);
   const [currentUser, setCurrentUser] = useState<UserDB | null>(null);
